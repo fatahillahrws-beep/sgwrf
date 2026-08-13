@@ -894,9 +894,9 @@ with tabs[0]:
     st.subheader("Overview SGWRF")
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(plot_scatter_actual_pred(results, R["y_col"]), use_container_width=True)
+        st.plotly_chart(plot_scatter_actual_pred(results, R["y_col"]), use_container_width=True, key="overview_actual_pred")
     with c2:
-        st.plotly_chart(plot_global_importance(results, R["x_cols"], R["labels"]), use_container_width=True)
+        st.plotly_chart(plot_global_importance(results, R["x_cols"], R["labels"]), use_container_width=True, key="global_importance_overview")
 
     st.markdown("#### Statistik preprocessing")
     prep = pd.DataFrame({
@@ -919,7 +919,7 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Optimasi Bandwidth Adaptive")
-    st.plotly_chart(plot_bandwidth_heatmap(R["bw_results"]), use_container_width=True)
+    st.plotly_chart(plot_bandwidth_heatmap(R["bw_results"]), use_container_width=True, key="bandwidth_heatmap")
     st.dataframe(R["bw_results"], use_container_width=True, hide_index=True)
     st.download_button("⬇️ Download hasil optimasi bandwidth CSV",
                        R["bw_results"].to_csv(index=False).encode("utf-8"),
@@ -931,7 +931,7 @@ with tabs[3]:
     fig = px.bar(R["rf_results"].astype({"n_estimators": int}), x="RMSE_CV", y="n_estimators",
                  color="RMSE_CV", orientation="h", hover_data=["max_features", "min_samples_leaf", "max_depth"],
                  title="RMSE CV setiap konfigurasi RF", template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="rf_tuning_rmse")
     st.json({"RF terbaik": R["best_rf"]})
 
 with tabs[4]:
@@ -940,7 +940,7 @@ with tabs[4]:
                 "dominant_variable", "dominant_importance", "local_train_R2", "local_train_RMSE",
                 "local_train_MAE", "bandwidth_geo_k", "bandwidth_attr_k"]
     st.dataframe(results[loc_cols], use_container_width=True, hide_index=True)
-    st.plotly_chart(plot_residuals(results, R["name_col"]), use_container_width=True)
+    st.plotly_chart(plot_residuals(results, R["name_col"]), use_container_width=True, key="local_residuals")
 
     selected = st.selectbox("Lihat detail titik", results["point_no"].tolist())
     row = results[results["point_no"] == selected].iloc[0]
@@ -948,12 +948,12 @@ with tabs[4]:
     d_imp = pd.DataFrame({"variable": [R["labels"].get(c,c) for c in R["x_cols"]],
                           "importance": [row[f"VI_{c}"] * 100 for c in R["x_cols"]]}).sort_values("importance", ascending=True)
     st.plotly_chart(px.bar(d_imp, x="importance", y="variable", orientation="h", title="Local permutation importance",
-                           labels={"importance": "Importance (%)"}, template="plotly_white"), use_container_width=True)
+                           labels={"importance": "Importance (%)"}, template="plotly_white"), use_container_width=True, key="selected_point_importance")
 
 with tabs[5]:
     st.subheader("Variable Importance")
-    st.plotly_chart(plot_global_importance(results, R["x_cols"], R["labels"]), use_container_width=True)
-    st.plotly_chart(plot_local_importance_heatmap(results, R["x_cols"], R["labels"]), use_container_width=True)
+    st.plotly_chart(plot_global_importance(results, R["x_cols"], R["labels"]), use_container_width=True, key="global_importance_tab")
+    st.plotly_chart(plot_local_importance_heatmap(results, R["x_cols"], R["labels"]), use_container_width=True, key="local_importance_heatmap")
     imp_long = []
     for _, rr in results.iterrows():
         for c in R["x_cols"]:
@@ -980,7 +980,7 @@ with tabs[6]:
     coef_df = pd.DataFrame(coef_rows)
     st.plotly_chart(px.imshow(coef_df.pivot(index="point_no", columns="variable", values="coefficient_ridge"),
                               aspect="auto", color_continuous_scale="RdBu", title="Koefisien Weighted Ridge Lokal (diagnostik)",
-                              labels={"color": "Koefisien"}), use_container_width=True)
+                              labels={"color": "Koefisien"}), use_container_width=True, key="ridge_coefficient_heatmap")
 
 with tabs[7]:
     st.subheader("Perbandingan Model Baseline")
@@ -990,10 +990,10 @@ with tabs[7]:
         st.dataframe(R["baseline"], use_container_width=True, hide_index=True)
         fig = px.bar(R["baseline"], x="Model", y="RMSE", color="Model", title="Perbandingan RMSE Model",
                      template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="baseline_rmse")
         fig2 = px.bar(R["baseline"], x="Model", y="R2", color="Model", title="Perbandingan R² Model",
                       template="plotly_white")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True, key="baseline_r2")
 
 with tabs[8]:
     st.subheader("Download Semua Output")
