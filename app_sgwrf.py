@@ -33,7 +33,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from scipy.spatial.distance import cdist
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import StandardScaler
@@ -44,6 +43,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 warnings.filterwarnings("ignore")
+
+# SciPy sengaja tidak digunakan oleh dashboard ini.
+# Jarak atribut dihitung dengan NumPy agar Streamlit Cloud tidak
+# berhenti hanya karena scipy belum tersedia.
 
 # Optional mapping stack
 try:
@@ -768,7 +771,10 @@ if run or st.session_state.get("config_key") != config_key:
     scaler = StandardScaler()
     Z = scaler.fit_transform(X)
     d_geo = haversine_km(coords)
-    d_attr = cdist(Z, Z, metric="euclidean")
+    # Jarak atribut Euclidean dihitung dengan NumPy.
+    # Tidak membutuhkan scipy.spatial.distance.cdist.
+    z2 = np.sum(Z * Z, axis=1)
+    d_attr = np.sqrt(np.maximum(z2[:, None] + z2[None, :] - 2.0 * (Z @ Z.T), 0.0))
 
     st.session_state["data_summary"] = {
         "n_before": n_before, "n_valid": n_valid, "p": len(x_cols),
@@ -845,7 +851,15 @@ st.caption(f"Jarak geografis maksimum: {R['d_geo'].max():.3f} km · Jarak atribu
 #
 # ================================================================
 tabs = st.tabs([
-    "🎯 Importance", "📐 Diagnostic", "⚖️ Baseline", "📥 Download"
+    "🎯 Overview",
+    "🗺️ Peta Interaktif",
+    "📐 Bandwidth",
+    "🌲 RF Tuning",
+    "📍 Hasil Lokal",
+    "🎯 Importance",
+    "📊 Diagnostic",
+    "⚖️ Baseline",
+    "📥 Download",
 ])
 
 with tabs[0]:
