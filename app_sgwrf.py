@@ -33,11 +33,39 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.inspection import permutation_importance
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+# scikit-learn is required by SGWRF. On Streamlit Cloud it MUST be installed
+# from requirements.txt before the app starts.
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.inspection import permutation_importance
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+except ModuleNotFoundError as e:
+    if e.name == "sklearn":
+        st.error(
+            "❌ scikit-learn belum terpasang di environment Streamlit Cloud. "
+            "Tambahkan file requirements.txt di ROOT repository dan lakukan Reboot/Redeploy."
+        )
+        st.code(
+            "streamlit>=1.36\n"
+            "pandas>=2.0\n"
+            "numpy>=1.24\n"
+            "scikit-learn>=1.3\n"
+            "openpyxl>=3.1\n"
+            "plotly>=5.20\n"
+            "geopandas>=0.14\n"
+            "shapely>=2.0\n"
+            "pyproj>=3.6\n"
+            "requests>=2.31\n"
+            "folium>=0.16\n"
+            "streamlit-folium>=0.20\n"
+            "branca>=0.7\n"
+            "fiona>=1.9",
+            language="text"
+        )
+        st.stop()
+    raise
 
 import plotly.express as px
 import plotly.graph_objects as go
