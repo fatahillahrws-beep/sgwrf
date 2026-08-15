@@ -63,7 +63,42 @@ div[data-testid="stMetric"]{
     padding:0.7rem 0.9rem;box-shadow:0 1px 3px rgba(15,76,129,0.08);
 }
 section[data-testid="stSidebar"]{background:#0f4c81;}
-section[data-testid="stSidebar"] *{color:#eef4fb !important;}
+/* Teks label, judul, dan keterangan di sidebar dibuat terang agar kontras
+   dengan latar biru gelap. */
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span:not([data-baseweb] *),
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] .stMarkdown,
+section[data-testid="stSidebar"] .stCaption,
+section[data-testid="stSidebar"] small{
+    color:#eef4fb;
+}
+/* Kotak input/dropdown/file-uploader tetap berlatar terang, sehingga
+   teks di DALAM kotak tersebut harus gelap agar terbaca jelas. */
+section[data-testid="stSidebar"] div[data-baseweb="select"] *,
+section[data-testid="stSidebar"] div[data-baseweb="popover"] *,
+section[data-testid="stSidebar"] div[role="listbox"] *,
+section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzone"] *,
+section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzoneInstructions"] *,
+section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"] *,
+section[data-testid="stSidebar"] input,
+section[data-testid="stSidebar"] textarea{
+    color:#1a2733 !important;
+}
+section[data-testid="stSidebar"] div[data-baseweb="select"] > div{
+    background:#ffffff;border-radius:8px;
+}
+section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzone"],
+section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"]{
+    background:#ffffff;border-radius:10px;
+}
+/* Placeholder / teks bantu ("Choose an option", nama file terunggah, dsb.) */
+section[data-testid="stSidebar"] div[data-baseweb="select"] div[class*="placeholder"]{
+    color:#5a6b7a !important;
+}
 section[data-testid="stSidebar"] .stButton>button{
     background:var(--sgwrf-accent);color:#20242b !important;font-weight:700;
     border:none;border-radius:8px;
