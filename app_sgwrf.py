@@ -9,9 +9,16 @@
 #   (2.18)-(2.19) Jarak atribut d_ij = mean_k |z_ik - z_jk|
 #   (2.20)        Similarity weight w_ij^S = exp(-d_ij^2)
 #   (2.24)        W_GS = alpha * W_G + gamma * W_S,  gamma = 1 - alpha
-#   (2.28)-(2.33) Optimasi alpha/gamma via AICc (ENP = trace(S), proxy)
+#   (2.28)-(2.33) k_geo & alpha/gamma dicari BERSAMA lewat LOOCV (kriteria
+#                 utama = RMSE_CV); AICc dihitung sebagai diagnostik
+#                 tambahan (ENP = trace(S), proxy), BUKAN kriteria pemilihan
 #   (2.35)        Treewise permutation variable importance
 #   (2.36)-(2.38) RMSE, MAPE, R2 (evaluasi utama memakai LOOCV)
+#
+# Model baseline (RF, GWR, GWRF, SGWR, SGWRF) semuanya dievaluasi dengan
+# LOOCV; RF (global) dan GWRF di-tuning ULANG secara independen (bukan
+# memakai hyperparameter SGWRF), sedangkan SGWRF baseline memakai
+# hyperparameter RF yang sama dengan model utama.
 #
 # Data TIDAK di-hardcode — pengguna mengunggah file sendiri (xlsx/csv),
 # memetakan kolom, mengatur parameter, lalu menjalankan seluruh pipeline.
@@ -142,9 +149,9 @@ st.markdown(
     <h1>🛰️ SGWRF Interactive Dashboard</h1>
     <p>Semi-parametric Geographically Weighted Random Forest — jarak geografis Euclidean +
     kernel Gaussian adaptif, jarak atribut (mean |Z<sub>i</sub>-Z<sub>j</sub>|) + similarity weight,
-    kombinasi aditif W<sub>GS</sub> = α·W<sub>G</sub> + γ·W<sub>S</sub> yang dioptimasi lewat AICc,
-    model Random Forest lokal, dan treewise permutation importance. Unggah data Anda sendiri —
-    peta &amp; grafik menyesuaikan otomatis.</p>
+    kombinasi aditif W<sub>GS</sub> = α·W<sub>G</sub> + γ·W<sub>S</sub> dengan k<sub>geo</sub> &amp; α
+    dicari BERSAMA lewat LOOCV (AICc sebagai diagnostik tambahan), model Random Forest lokal, dan
+    treewise permutation importance. Unggah data Anda sendiri — peta &amp; grafik menyesuaikan otomatis.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -155,8 +162,7 @@ st.markdown(
 # ================================================================
 
 def geographic_distance_euclidean(coords):
-    """Persamaan (2.10): d_ij^G = sqrt[(u_i-u_j)^2 + (v_i-v_j)^2].
-    Koordinat (lat, lon) dipakai langsung sebagai (u, v) sesuai draft."""
+    """Persamaan (2.10): d_ij^G = sqrt[(u_i-u_j)^2 + (v_i-v_j)^2]."""
     return cdist(coords, coords, metric="euclidean")
 
 
@@ -188,8 +194,8 @@ def similarity_weight(d_attr):
 
 def build_weight_components(d_geo, d_attr, k_geo, alpha):
     """Persamaan (2.11), (2.20), (2.24):
-    W_GS = alpha * W_G + gamma * W_S,  gamma = 1 - alpha.
-    Kombinasi ADITIF (bukan perkalian), tanpa bandwidth atribut."""
+    W_GS = alpha * W_G + gamma * W_S,  gamma = 1 - alpha (ADITIF, tanpa
+    bandwidth atribut, tanpa normalisasi baris)."""
     bg_local = adaptive_bandwidth_matrix(d_geo, k_geo)
     Wg = gaussian_kernel(d_geo, bg_local[:, None])
     Ws = similarity_weight(d_attr)
@@ -203,9 +209,9 @@ def prepare_matrices(df, x_cols, y_col, lat_col, lon_col):
     y = df[y_col].to_numpy(float)
     coords = df[[lat_col, lon_col]].to_numpy(float)
     scaler = StandardScaler()
-    Z = scaler.fit_transform(X)                      # (2.3)-(2.5)
-    d_geo = geographic_distance_euclidean(coords)      # (2.10)
-    d_attr = attribute_pairwise_distance(Z)            # (2.18)-(2.19)
+    Z = scaler.fit_transform(X)                        # (2.3)-(2.5)
+    d_geo = geographic_distance_euclidean(coords)        # (2.10)
+    d_attr = attribute_pairwise_distance(Z)              # (2.18)-(2.19)
     return X, Z, y, coords, d_geo, d_attr, scaler
 
 
@@ -241,14 +247,20 @@ def local_prediction_for_target(i, X, y, W, params, random_state, leave_target_o
     return model, float(pred[0]), train_mask, w
 
 
-def predict_local_rf_cv(X, y, W, params, base_seed, seed_offset):
-    """Prediksi LOOCV Random Forest lokal — dipakai untuk evaluasi utama
-    (menghindari kebocoran data karena target ikut menjadi data latih)."""
+def cv_score_local_rf(X, y, W, params, base_seed, seed_offset):
+    """LOOCV untuk Random Forest lokal berbobot (dipakai di seluruh tahap
+    optimasi/seleksi: pencarian k_geo x alpha, tuning RF, dan baseline)."""
     preds = np.full(len(y), np.nan)
     for i in range(len(y)):
         _, pred, _, _ = local_prediction_for_target(i, X, y, W, params, base_seed + seed_offset + i, True)
         preds[i] = pred
     return preds
+
+
+def predict_local_rf_cv(X, y, W, params, base_seed, seed_offset):
+    """Alias eksplisit untuk prediksi LOOCV — dipakai untuk evaluasi utama
+    model final dan baseline GWRF/SGWRF."""
+    return cv_score_local_rf(X, y, W, params, base_seed, seed_offset)
 
 
 def predict_weighted_linear_cv(X, y, W):
@@ -267,42 +279,30 @@ def predict_weighted_linear_cv(X, y, W):
     return preds
 
 
-# ---------------- 1a. Optimasi bandwidth geografis (k_geo) ----------------
-
-def cv_score_geo_bandwidth(k_geo, X, y, d_geo, d_attr, alpha, params, leave_target_out, base_seed):
-    W, *_ = build_weight_components(d_geo, d_attr, k_geo, alpha)
+def predict_global_rf_cv(X, y, params, base_seed, seed_offset):
+    """LOOCV Random Forest GLOBAL (tanpa pembobotan spasial) — baseline RF."""
     preds = np.full(len(y), np.nan)
     for i in range(len(y)):
-        _, pred, _, _ = local_prediction_for_target(i, X, y, W, params, base_seed + i, leave_target_out)
-        preds[i] = pred
-    residual = y - preds
-    return float(np.sum(residual ** 2)), float(np.sqrt(np.mean(residual ** 2))), preds
+        mask = np.ones(len(y), dtype=bool)
+        mask[i] = False
+        model = RandomForestRegressor(
+            n_estimators=params.get("n_estimators", 100),
+            max_features=params.get("max_features", "sqrt"),
+            min_samples_leaf=params.get("min_samples_leaf", 1),
+            max_depth=params.get("max_depth", None),
+            random_state=base_seed + seed_offset + i,
+            n_jobs=-1,
+        )
+        model.fit(X[mask], y[mask])
+        preds[i] = float(model.predict(X[i:i + 1])[0])
+    return preds
 
 
-def optimize_geographic_bandwidth(X, y, d_geo, d_attr, alpha_initial, cfg, progress_cb=None):
-    candidates = candidate_geo_bandwidths(len(y), cfg["min_k_geo"], cfg["max_k_geo"])
-    cv_params = {"n_estimators": cfg["rf_cv_trees"], "max_features": "sqrt", "min_samples_leaf": 1, "max_depth": None}
-    rows, best = [], None
-    t0 = time.time()
-    for no, k_geo in enumerate(candidates, 1):
-        rss, rmse, _ = cv_score_geo_bandwidth(k_geo, X, y, d_geo, d_attr, alpha_initial, cv_params,
-                                               cfg["leave_target_out"], cfg["seed"])
-        row = {"iteration": no, "k_geo": int(k_geo), "alpha_awal": alpha_initial, "RSS_CV": rss, "RMSE_CV": rmse}
-        rows.append(row)
-        if best is None or rmse < best["RMSE_CV"]:
-            best = row.copy()
-        if progress_cb:
-            progress_cb(no / len(candidates), f"k_geo={k_geo} — RMSE_CV={rmse:.4f}")
-    res = pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True)
-    return int(best["k_geo"]), res, time.time() - t0
-
-
-# ---------------- 1b. Optimasi alpha/gamma via AICc ----------------
+# ---------------- 1a. AICc (diagnostik tambahan, bukan kriteria seleksi) ----------------
 
 def normalized_weight_hat_proxy(W):
     """Proxy S untuk ENP = trace(S). RF tidak punya hat matrix linear
-    eksplisit; proxy = normalized local weight matrix, sesuai catatan
-    metodologis pada script asli."""
+    eksplisit; proxy = normalized local weight matrix."""
     row_sum = W.sum(axis=1, keepdims=True)
     return W / np.maximum(row_sum, 1e-15)
 
@@ -322,65 +322,98 @@ def aicc_from_rss(rss, n, enp):
             + (2.0 * (enp + 1.0) * (enp + 2.0)) / denom)
 
 
-def optimize_alpha(X, y, d_geo, d_attr, k_geo, cfg, progress_cb=None):
-    alpha_grid = np.linspace(cfg["alpha_min"], cfg["alpha_max"], cfg["n_alpha"])
-    cv_params = {"n_estimators": cfg["rf_cv_trees"], "max_features": "sqrt", "min_samples_leaf": 1, "max_depth": None}
-    rows, best = [], None
+def metrics_dict(y, pred):
+    """Persamaan (2.36)-(2.38) + RSS (2.30)."""
+    err = y - pred
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mae = float(np.mean(np.abs(err)))
+    denom = np.where(np.abs(y) < 1e-12, np.nan, np.abs(y))
+    mape = float(np.nanmean(np.abs(err) / denom) * 100)
+    r2 = float(r2_score(y, pred))
+    rss = float(np.sum(err ** 2))
+    return {"RMSE": rmse, "MAE": mae, "MAPE": mape, "R2": r2, "RSS": rss}
+
+
+# ---------------- 1b. Pencarian BERSAMA k_geo x alpha (kriteria utama: RMSE-LOOCV) ----------------
+
+def optimize_spatial_parameters(X, y, d_geo, d_attr, cfg, progress_cb=None):
+    """Pencarian ekspansif k_geo x alpha. Kriteria utama = RMSE LOOCV
+    (Persamaan 2.32); AICc dihitung sebagai diagnostik tambahan saja,
+    BUKAN kriteria pemilihan utama."""
+    k_candidates = candidate_geo_bandwidths(len(y), cfg["min_k_geo"], cfg["max_k_geo"])
+    alpha_candidates = np.round(np.linspace(cfg["alpha_min"], cfg["alpha_max"], cfg["n_alpha"]), 4)
+
+    search_params = {"n_estimators": cfg["rf_cv_trees"], "max_features": "sqrt",
+                      "min_samples_leaf": 1, "max_depth": None}
+
+    rows = []
+    best = None
     t0 = time.time()
-    for no, alpha in enumerate(alpha_grid, 1):
-        alpha = float(alpha)
-        gamma = 1.0 - alpha
-        W, *_ = build_weight_components(d_geo, d_attr, k_geo, alpha)
-        preds = np.full(len(y), np.nan)
-        for i in range(len(y)):
-            _, pred, _, _ = local_prediction_for_target(
-                i, X, y, W, cv_params, cfg["seed"] + 10000 + no * 100 + i, cfg["leave_target_out"]
-            )
-            preds[i] = pred
-        residual = y - preds
-        rss = float(np.sum(residual ** 2))
-        enp = effective_number_parameters(W)
-        aicc = aicc_from_rss(rss, len(y), enp)
-        row = {"iteration": no, "alpha": alpha, "gamma": gamma, "RSS": rss, "ENP": enp,
-               "AICc": aicc, "RMSE_CV": float(np.sqrt(np.mean(residual ** 2)))}
-        rows.append(row)
-        if best is None or aicc < best["AICc"]:
-            best = row.copy()
-        if progress_cb:
-            progress_cb(no / len(alpha_grid), f"alpha={alpha:.3f} — AICc={aicc:.2f}")
-    results = pd.DataFrame(rows).sort_values("AICc").reset_index(drop=True)
-    return float(best["alpha"]), float(best["gamma"]), results, time.time() - t0
+    total = len(k_candidates) * len(alpha_candidates)
+    counter = 0
+
+    for k_geo in k_candidates:
+        for alpha in alpha_candidates:
+            counter += 1
+            alpha = float(alpha)
+            W, Wg, Ws, bg_local, gamma = build_weight_components(d_geo, d_attr, k_geo, alpha)
+            preds = cv_score_local_rf(X, y, W, search_params, cfg["seed"], 100000 + counter * 100)
+            m = metrics_dict(y, preds)
+            enp = effective_number_parameters(W)
+            aicc = aicc_from_rss(m["RSS"], len(y), enp)
+
+            row = {
+                "iteration": counter, "k_geo": int(k_geo), "alpha": alpha, "gamma": float(gamma),
+                "RMSE_CV": m["RMSE"], "MAE_CV": m["MAE"], "MAPE_CV": m["MAPE"], "R2_CV": m["R2"],
+                "RSS_CV": m["RSS"], "ENP_proxy": enp, "AICc": aicc,
+            }
+            rows.append(row)
+            if best is None or row["RMSE_CV"] < best["RMSE_CV"]:
+                best = row.copy()
+
+            if progress_cb and (counter % max(1, total // 100) == 0 or counter == total):
+                progress_cb(counter / total,
+                            f"[{counter}/{total}] k_geo={k_geo}, α={alpha:.3f} — RMSE_CV={m['RMSE']:.4f}")
+
+    results = pd.DataFrame(rows).sort_values(
+        ["RMSE_CV", "MAE_CV", "AICc"], ascending=[True, True, True]
+    ).reset_index(drop=True)
+
+    return int(best["k_geo"]), float(best["alpha"]), float(best["gamma"]), results, time.time() - t0
 
 
-# ---------------- 1c. Optimasi hyperparameter Random Forest ----------------
+# ---------------- 1c. Optimasi hyperparameter Random Forest (LOOCV) ----------------
 
-def optimize_rf(X, y, W, cfg, param_grid, progress_cb=None):
+def optimize_rf(X, y, W, cfg, param_grid, global_model=False, progress_cb=None):
+    """global_model=True → RF tanpa bobot spasial (LOOCV polos, dipakai
+    untuk baseline RF). global_model=False → RF lokal berbobot W (LOOCV),
+    dipakai untuk model utama SGWRF maupun baseline GWRF."""
     rows, best = [], None
     total = len(param_grid)
     for j, params in enumerate(param_grid, 1):
         p = params.copy()
         p["n_estimators"] = min(p["n_estimators"], cfg["rf_cv_trees"])
-        preds = np.full(len(y), np.nan)
-        for i in range(len(y)):
-            _, pred, _, _ = local_prediction_for_target(
-                i, X, y, W, p, cfg["seed"] + 20000 + j * 100 + i, cfg["leave_target_out"]
-            )
-            preds[i] = pred
-        rmse = float(np.sqrt(mean_squared_error(y, preds)))
-        rows.append({**p, "RMSE_CV": rmse})
-        if best is None or rmse < best["RMSE_CV"]:
-            best = rows[-1].copy()
+
+        if global_model:
+            preds = predict_global_rf_cv(X, y, p, cfg["seed"], 50000 + j * 1000)
+        else:
+            preds = cv_score_local_rf(X, y, W, p, cfg["seed"], 200000 + j * 1000)
+
+        m = metrics_dict(y, preds)
+        row = {**p, "RMSE_CV": m["RMSE"], "MAE_CV": m["MAE"], "MAPE_CV": m["MAPE"], "R2_CV": m["R2"]}
+        rows.append(row)
+        if best is None or (row["RMSE_CV"], row["MAE_CV"]) < (best["RMSE_CV"], best["MAE_CV"]):
+            best = row.copy()
         if progress_cb:
-            progress_cb(j / total, f"RF config {j}/{total} — RMSE_CV={rmse:.4f}")
-    return best, pd.DataFrame(rows)
+            progress_cb(j / total, f"RF config {j}/{total} — RMSE_CV={m['RMSE']:.4f}")
+    results = pd.DataFrame(rows).sort_values(["RMSE_CV", "MAE_CV"], ascending=[True, True]).reset_index(drop=True)
+    return best, results
 
 
 # ---------------- 1d. Model lokal final + treewise importance (2.35) ----------------
 
 def local_treewise_variable_importance(model, X_train, y_train, sample_weight, seed):
-    """Persamaan (2.35): VI_ik = (1/B) * sum_b (E_ib,k^perm - E_ib).
-    Untuk tiap pohon di forest: hitung weighted MSE sebelum & sesudah
-    kovariat k dipermutasi, lalu rata-ratakan selisihnya ke semua pohon."""
+    """Persamaan (2.35): VI_ik = (1/B) * sum_b (E_ib,k^perm - E_ib)."""
     n_train, p = X_train.shape
     B = len(model.estimators_)
     if n_train < 2:
@@ -409,9 +442,9 @@ def local_treewise_variable_importance(model, X_train, y_train, sample_weight, s
 
 def train_local_models(X, y, W, df, name_col, x_cols, x_labels, rf_final, cfg, progress_cb=None):
     """Model final per titik: TIDAK leave-target-out (bobot titik sendiri
-    ikut serta bila w_ii > 0), sesuai script terbaru — semua titik menjadi
-    penyumbang informasi lokal untuk model final. Evaluasi utama tetap
-    memakai prediksi LOOCV terpisah (lihat predict_local_rf_cv)."""
+    ikut serta bila w_ii > 0) — semua titik menjadi penyumbang informasi
+    lokal untuk model final. Evaluasi utama tetap memakai prediksi LOOCV
+    terpisah (lihat predict_local_rf_cv)."""
     n = len(y)
     p = X.shape[1]
     preds = np.full(n, np.nan)
@@ -463,58 +496,58 @@ def train_local_models(X, y, W, df, name_col, x_cols, x_labels, rf_final, cfg, p
     return preds, local_r2, local_mae, local_rmse, importances
 
 
-def metrics_dict(y, pred):
-    """Persamaan (2.36)-(2.38) + RSS (2.30)."""
-    err = y - pred
-    rmse = float(np.sqrt(np.mean(err ** 2)))
-    mae = float(np.mean(np.abs(err)))
-    denom = np.where(np.abs(y) < 1e-12, np.nan, np.abs(y))
-    mape = float(np.nanmean(np.abs(err) / denom) * 100)
-    r2 = float(r2_score(y, pred))
-    rss = float(np.sum(err ** 2))
-    return {"RMSE": rmse, "MAE": mae, "MAPE": mape, "R2": r2, "RSS": rss}
-
-
-def run_baselines(X, y, d_geo, d_attr, k_geo, alpha, cfg, progress_cb=None):
-    """Model pembanding: RF global, GWR (linear terboboti geografis),
-    GWRF (RF terboboti geografis), SGWR (linear terboboti W_GS),
-    SGWRF (RF terboboti W_GS — LOOCV, sanity-check untuk model utama)."""
+def run_baselines(X, y, d_geo, d_attr, k_geo, alpha, sgwrf_params, cfg, rf_param_grid, progress_cb=None):
+    """Model pembanding, semua dievaluasi dengan LOOCV:
+    - RF (global): RF di-tuning ULANG (tanpa bobot spasial)
+    - GWR: regresi linear terboboti geografis (W_G)
+    - GWRF: RF di-tuning ULANG dengan bobot geografis (W_G)
+    - SGWR: regresi linear terboboti gabungan (W_GS)
+    - SGWRF: RF memakai hyperparameter yang SAMA dengan model utama (sgwrf_params)
+    """
     rows = []
-    steps, step = 5, 0
 
-    rf = RandomForestRegressor(n_estimators=cfg["rf_final_trees"], max_features="sqrt",
-                                min_samples_leaf=1, random_state=cfg["seed"], n_jobs=-1)
-    rf.fit(X, y)
-    rows.append({"Model": "RF (global)", **metrics_dict(y, rf.predict(X))})
-    step += 1
-    if progress_cb: progress_cb(step / steps, "Baseline: RF global")
+    def sub_progress(base, span):
+        def cb(frac, text):
+            if progress_cb:
+                progress_cb(base + span * frac, text)
+        return cb
 
+    # --- RF global: tuning ulang + LOOCV ---
+    best_rf_global, rf_global_tuning = optimize_rf(
+        X, y, None, cfg, rf_param_grid, global_model=True, progress_cb=sub_progress(0.00, 0.35)
+    )
+    p_rf = predict_global_rf_cv(X, y, best_rf_global, cfg["seed"], 60000)
+    rows.append({"Model": "RF (global, di-tuning ulang)", **metrics_dict(y, p_rf)})
+    if progress_cb: progress_cb(0.35, "Baseline: RF global selesai")
+
+    # --- GWR: linear terboboti geografis, LOOCV ---
     bg_local = adaptive_bandwidth_matrix(d_geo, k_geo)
     Wg = gaussian_kernel(d_geo, bg_local[:, None])
-
     p_gwr = predict_weighted_linear_cv(X, y, Wg)
     rows.append({"Model": "GWR", **metrics_dict(y, p_gwr)})
-    step += 1
-    if progress_cb: progress_cb(step / steps, "Baseline: GWR")
+    if progress_cb: progress_cb(0.40, "Baseline: GWR selesai")
 
-    rf_params = {"n_estimators": cfg["rf_cv_trees"], "max_features": "sqrt", "min_samples_leaf": 1, "max_depth": None}
-    p_gwrf = predict_local_rf_cv(X, y, Wg, rf_params, cfg["seed"], 40000)
-    rows.append({"Model": "GWRF", **metrics_dict(y, p_gwrf)})
-    step += 1
-    if progress_cb: progress_cb(step / steps, "Baseline: GWRF")
+    # --- GWRF: tuning ulang dengan W_G + LOOCV ---
+    best_gwrf, gwrf_tuning = optimize_rf(
+        X, y, Wg, cfg, rf_param_grid, global_model=False, progress_cb=sub_progress(0.40, 0.45)
+    )
+    p_gwrf = predict_local_rf_cv(X, y, Wg, best_gwrf, cfg["seed"], 40000)
+    rows.append({"Model": "GWRF (di-tuning ulang)", **metrics_dict(y, p_gwrf)})
+    if progress_cb: progress_cb(0.85, "Baseline: GWRF selesai")
 
+    # --- SGWR: linear terboboti gabungan, LOOCV ---
     Wgs, *_ = build_weight_components(d_geo, d_attr, k_geo, alpha)
     p_sgwr = predict_weighted_linear_cv(X, y, Wgs)
     rows.append({"Model": "SGWR", **metrics_dict(y, p_sgwr)})
-    step += 1
-    if progress_cb: progress_cb(step / steps, "Baseline: SGWR")
+    if progress_cb: progress_cb(0.92, "Baseline: SGWR selesai")
 
-    p_sgwrf = predict_local_rf_cv(X, y, Wgs, rf_params, cfg["seed"], 41000)
-    rows.append({"Model": "SGWRF (LOOCV)", **metrics_dict(y, p_sgwrf)})
-    step += 1
-    if progress_cb: progress_cb(step / steps, "Baseline: SGWRF (LOOCV)")
+    # --- SGWRF: pakai hyperparameter model utama, LOOCV ---
+    p_sgwrf = predict_local_rf_cv(X, y, Wgs, sgwrf_params, cfg["seed"], 41000)
+    rows.append({"Model": "SGWRF (parameter sama dgn model utama)", **metrics_dict(y, p_sgwrf)})
+    if progress_cb: progress_cb(1.0, "Baseline: SGWRF selesai")
 
-    return pd.DataFrame(rows).sort_values("RMSE").reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(["RMSE", "MAE"], ascending=[True, True]).reset_index(drop=True)
+    return out, rf_global_tuning, gwrf_tuning
 
 
 def build_results(df, id_col, name_col, lat_col, lon_col, y_col, x_cols, x_labels,
@@ -679,6 +712,26 @@ def data_fingerprint(uploaded_name, n_rows, id_col, name_col, lat_col, lon_col, 
     return (uploaded_name, n_rows, id_col, name_col, lat_col, lon_col, y_col, tuple(sorted(x_cols)))
 
 
+def build_rf_param_grid(rf_cv_trees):
+    """Meniru grid 12-konfigurasi pada script asli, diskalakan mengikuti
+    slider 'jumlah pohon tahap CV' di sidebar."""
+    first_trees = min(120, rf_cv_trees)
+    return [
+        {"n_estimators": first_trees, "max_features": "sqrt", "min_samples_leaf": 1, "max_depth": None},
+        {"n_estimators": rf_cv_trees, "max_features": "sqrt", "min_samples_leaf": 1, "max_depth": None},
+        {"n_estimators": rf_cv_trees, "max_features": 0.5, "min_samples_leaf": 1, "max_depth": None},
+        {"n_estimators": rf_cv_trees, "max_features": 0.7, "min_samples_leaf": 1, "max_depth": None},
+        {"n_estimators": rf_cv_trees, "max_features": 1.0, "min_samples_leaf": 1, "max_depth": None},
+        {"n_estimators": rf_cv_trees, "max_features": "sqrt", "min_samples_leaf": 2, "max_depth": None},
+        {"n_estimators": rf_cv_trees, "max_features": 0.5, "min_samples_leaf": 2, "max_depth": None},
+        {"n_estimators": rf_cv_trees, "max_features": 1.0, "min_samples_leaf": 2, "max_depth": None},
+        {"n_estimators": rf_cv_trees, "max_features": "sqrt", "min_samples_leaf": 1, "max_depth": 4},
+        {"n_estimators": rf_cv_trees, "max_features": 0.7, "min_samples_leaf": 1, "max_depth": 4},
+        {"n_estimators": rf_cv_trees, "max_features": 0.7, "min_samples_leaf": 2, "max_depth": 5},
+        {"n_estimators": rf_cv_trees, "max_features": 1.0, "min_samples_leaf": 2, "max_depth": 5},
+    ]
+
+
 # ================================================================
 # 4. SIDEBAR — UPLOAD, PEMETAAN KOLOM, PARAMETER
 # ================================================================
@@ -745,53 +798,52 @@ with st.sidebar:
 
     n_points = len(raw_df.dropna(subset=[id_col, name_col, lat_col, lon_col, y_col] + x_cols))
 
-    st.subheader("3️⃣ Bandwidth Geografis (k)")
-    default_min_k = min(5, max(2, n_points - 1))
-    min_k_geo, max_k_geo = st.slider("Rentang k tetangga terdekat geografis", 2, max(3, n_points - 1),
-                                      (default_min_k, min(max(default_min_k + 5, 6), n_points - 1)))
-    leave_target_out = st.checkbox("Leave-target-out (LOO) saat validasi/optimasi", value=True,
-                                    help="Dipakai pada tahap optimasi k_geo, alpha, RF, dan baseline. "
-                                         "Model final tetap dilatih menyertakan bobot titik itu sendiri "
-                                         "sesuai desain SGWRF; evaluasi utama tetap memakai prediksi LOOCV.")
-
-    st.subheader("4️⃣ Bobot α · γ (Persamaan 2.24 & AICc)")
-    alpha_min, alpha_max = st.slider("Rentang alpha (kontribusi bobot geografis)", 0.01, 1.0, (0.05, 1.0), step=0.01)
-    n_alpha = st.slider("Jumlah titik grid alpha", 5, 40, 20, step=1)
+    st.subheader("3️⃣ Pencarian Bersama k_geo × α (LOOCV)")
+    st.caption("k_geo dan α dicari SEKALIGUS dalam satu grid (Persamaan 2.28-2.33). "
+               "Kriteria utama = RMSE LOOCV; AICc ditampilkan sebagai diagnostik tambahan.")
+    default_min_k = 2
+    default_max_k = min(13, max(3, n_points - 1))
+    min_k_geo, max_k_geo = st.slider("Rentang k_geo (tetangga geografis terdekat)", 2,
+                                      max(3, n_points - 1), (default_min_k, default_max_k))
+    alpha_min, alpha_max = st.slider("Rentang alpha (kontribusi bobot geografis)", 0.01, 1.0, (0.025, 1.0), step=0.005)
+    n_alpha = st.slider("Jumlah titik grid alpha", 5, 40, 20, step=1,
+                         help="Script asli memakai 40 titik grid (0.025-1.0). Nilai lebih kecil "
+                              "mempercepat komputasi dengan sedikit kehilangan resolusi pencarian.")
 
     n_k_geo = max_k_geo - min_k_geo + 1
-    est_bw = n_k_geo * n_points
-    est_alpha = n_alpha * n_points
-    if n_points > 60 or (est_bw + est_alpha) > 15000:
+    total_combo = n_k_geo * n_alpha
+    est_search = total_combo * n_points
+    if n_points > 60 or est_search > 15000:
         st.warning(
-            f"⏱️ Data Anda memiliki **{n_points} titik**. Estimasi ~{est_bw:,} pelatihan model pada "
-            f"optimasi bandwidth geografis dan ~{est_alpha:,} pelatihan pada optimasi alpha. Ini bisa "
-            "memakan waktu cukup lama. Disarankan: persempit rentang k, kurangi jumlah titik grid alpha, "
+            f"⏱️ Data Anda memiliki **{n_points} titik** dengan **{total_combo:,} kombinasi** k_geo×α "
+            f"(estimasi ~{est_search:,} pelatihan model pada tahap pencarian bersama). Ini bisa memakan "
+            "waktu cukup lama. Disarankan: persempit rentang k_geo, kurangi jumlah titik grid alpha, "
             "atau kurangi jumlah pohon RF tahap CV di bawah."
         )
 
-    st.subheader("5️⃣ Parameter Random Forest")
-    rf_cv_trees = st.slider("Jumlah pohon (tahap optimasi/CV)", 20, 300, 80, step=10)
-    rf_final_trees = st.slider("Jumlah pohon (model final)", 100, 800, 300, step=50,
+    st.subheader("4️⃣ Parameter Random Forest")
+    rf_cv_trees = st.slider("Jumlah pohon (tahap optimasi/CV)", 20, 300, 180, step=10,
+                             help="Dipakai pada seluruh tahap LOOCV: pencarian k_geo×α, tuning grid RF "
+                                  "(12 konfigurasi), dan baseline RF/GWRF.")
+    rf_final_trees = st.slider("Jumlah pohon (model final)", 100, 1000, 800, step=50,
                                 help="Treewise permutation importance (Pers. 2.35) dihitung untuk SETIAP "
                                      "pohon di model final — makin banyak pohon, makin lama waktu komputasi.")
     seed = st.number_input("Random seed", 0, 99999, 2026)
 
-    st.subheader("6️⃣ Analisis Tambahan")
-    run_baseline_flag = st.checkbox("Jalankan model baseline (RF, GWR, GWRF, SGWR, SGWRF-LOOCV)", value=True)
+    st.subheader("5️⃣ Analisis Tambahan")
+    run_baseline_flag = st.checkbox(
+        "Jalankan model baseline (RF, GWR, GWRF, SGWR, SGWRF)", value=True,
+        help="RF dan GWRF akan di-tuning ULANG (grid 12 konfigurasi) secara independen, sehingga "
+             "tahap ini menambah waktu komputasi cukup signifikan."
+    )
 
     st.markdown("---")
     run_button = st.button("🚀 Jalankan Analisis SGWRF", use_container_width=True)
 
 cfg = dict(min_k_geo=min_k_geo, max_k_geo=max_k_geo, alpha_min=float(alpha_min), alpha_max=float(alpha_max),
-           n_alpha=int(n_alpha), leave_target_out=leave_target_out, rf_cv_trees=rf_cv_trees,
-           rf_final_trees=rf_final_trees, seed=int(seed))
+           n_alpha=int(n_alpha), rf_cv_trees=rf_cv_trees, rf_final_trees=rf_final_trees, seed=int(seed))
 
-RF_PARAM_GRID = [
-    {"n_estimators": rf_cv_trees, "max_features": "sqrt", "min_samples_leaf": 1, "max_depth": None},
-    {"n_estimators": rf_cv_trees, "max_features": 0.7, "min_samples_leaf": 1, "max_depth": None},
-    {"n_estimators": rf_cv_trees, "max_features": 1.0, "min_samples_leaf": 1, "max_depth": None},
-    {"n_estimators": rf_cv_trees, "max_features": "sqrt", "min_samples_leaf": 2, "max_depth": None},
-]
+RF_PARAM_GRID = build_rf_param_grid(rf_cv_trees)
 
 # --- boundary geojson (opsional) ---
 boundary = None
@@ -833,13 +885,13 @@ else:
 if st.session_state.get("sgwrf_prev_n") is not None and st.session_state["sgwrf_prev_n"] != n_after:
     st.info(
         f"📌 Jumlah titik data terdeteksi berubah: {st.session_state['sgwrf_prev_n']} → {n_after} titik. "
-        "Rentang parameter (misalnya k tetangga lokal) sudah menyesuaikan otomatis. "
+        "Rentang parameter (misalnya k_geo) sudah menyesuaikan otomatis. "
         "Tekan **Jalankan Analisis SGWRF** di sidebar untuk memproses data terbaru."
     )
 st.session_state["sgwrf_prev_n"] = n_after
 
-tab_data, tab_map, tab_bw, tab_alpha, tab_rf, tab_local, tab_baseline, tab_download = st.tabs(
-    ["📊 Data & Eksplorasi", "🗺️ Peta Interaktif", "🎯 Bandwidth Geografis", "⚖️ Optimasi α (AICc)",
+tab_data, tab_map, tab_spatial, tab_rf, tab_local, tab_baseline, tab_download = st.tabs(
+    ["📊 Data & Eksplorasi", "🗺️ Peta Interaktif", "🎯 Optimasi k_geo × α (LOOCV)",
      "🌲 Optimasi Random Forest", "📈 Model Lokal SGWRF", "🆚 Perbandingan Baseline", "📥 Unduh Hasil"]
 )
 
@@ -957,34 +1009,25 @@ with tab_map:
 if run_button:
     X, Z, y, coords, d_geo, d_attr, scaler = prepare_matrices(df, x_cols, y_col, lat_col, lon_col)
 
-    # --- 1) Bandwidth geografis (k_geo), alpha awal = 0.5 sebagai skala awal ---
-    prog = st.progress(0.0, text="Optimasi bandwidth geografis (k_geo)...")
-    def cb_bw(frac, text):
+    # --- 1) Pencarian bersama k_geo x alpha (kriteria: RMSE LOOCV) ---
+    prog = st.progress(0.0, text="Pencarian bersama k_geo × alpha (LOOCV)...")
+    def cb_spatial(frac, text):
         prog.progress(min(frac, 1.0), text=text)
-    best_k_geo, bw_results, elapsed_bw = optimize_geographic_bandwidth(
-        X, y, d_geo, d_attr, 0.5, cfg, progress_cb=cb_bw
+    best_k_geo, best_alpha, best_gamma, spatial_results, elapsed_sp = optimize_spatial_parameters(
+        X, y, d_geo, d_attr, cfg, progress_cb=cb_spatial
     )
-    prog.progress(1.0, text=f"Bandwidth geografis selesai ({elapsed_bw:.1f}s) — k*={best_k_geo}")
-
-    # --- 2) Optimasi alpha/gamma via AICc ---
-    prog_a = st.progress(0.0, text="Optimasi alpha & gamma (AICc)...")
-    def cb_a(frac, text):
-        prog_a.progress(min(frac, 1.0), text=text)
-    best_alpha, best_gamma, alpha_results, elapsed_a = optimize_alpha(
-        X, y, d_geo, d_attr, best_k_geo, cfg, progress_cb=cb_a
-    )
-    prog_a.progress(1.0, text=f"Optimasi alpha selesai ({elapsed_a:.1f}s) — α*={best_alpha:.3f}")
+    prog.progress(1.0, text=f"Pencarian selesai ({elapsed_sp:.1f}s) — k*={best_k_geo}, α*={best_alpha:.3f}")
 
     Wgs, Wg, Ws, bg_local, gamma_check = build_weight_components(d_geo, d_attr, best_k_geo, best_alpha)
 
-    # --- 3) Optimasi hyperparameter RF ---
-    prog2 = st.progress(0.0, text="Optimasi hyperparameter Random Forest...")
+    # --- 2) Optimasi hyperparameter RF (untuk model utama SGWRF) ---
+    prog2 = st.progress(0.0, text="Optimasi hyperparameter Random Forest (SGWRF)...")
     def cb_rf(frac, text):
         prog2.progress(min(frac, 1.0), text=text)
-    best_rf, rf_results = optimize_rf(X, y, Wgs, cfg, RF_PARAM_GRID, progress_cb=cb_rf)
+    best_rf, rf_results = optimize_rf(X, y, Wgs, cfg, RF_PARAM_GRID, global_model=False, progress_cb=cb_rf)
     prog2.progress(1.0, text="Optimasi Random Forest selesai")
 
-    # --- 4) Model lokal final (in-sample, self-weight ikut serta) ---
+    # --- 3) Model lokal final (in-sample, self-weight ikut serta) ---
     prog3 = st.progress(0.0, text="Melatih model lokal SGWRF final per titik...")
     def cb_local(frac, text):
         prog3.progress(min(frac, 1.0), text=text)
@@ -993,7 +1036,7 @@ if run_button:
     )
     prog3.progress(1.0, text="Model lokal final selesai")
 
-    # --- 5) Prediksi LOOCV (evaluasi utama, tanpa kebocoran data) ---
+    # --- 4) Prediksi LOOCV (evaluasi utama, tanpa kebocoran data) ---
     prog3b = st.progress(0.0, text="Menghitung prediksi LOOCV (evaluasi utama)...")
     final_rf_cv_params = {
         "n_estimators": cfg["rf_cv_trees"],
@@ -1011,20 +1054,23 @@ if run_button:
                              y, pred_in, pred_cv, local_r2, local_mae, local_rmse, importances,
                              bg_local, best_alpha, best_gamma)
 
-    baseline_results = None
+    baseline_results, rf_global_tuning, gwrf_tuning = None, None, None
     if run_baseline_flag:
-        prog4 = st.progress(0.0, text="Menjalankan model baseline pembanding...")
+        prog4 = st.progress(0.0, text="Menjalankan & men-tuning model baseline pembanding...")
         def cb_base(frac, text):
             prog4.progress(min(frac, 1.0), text=text)
-        baseline_results = run_baselines(X, y, d_geo, d_attr, best_k_geo, best_alpha, cfg, progress_cb=cb_base)
+        baseline_results, rf_global_tuning, gwrf_tuning = run_baselines(
+            X, y, d_geo, d_attr, best_k_geo, best_alpha, final_rf_cv_params, cfg, RF_PARAM_GRID,
+            progress_cb=cb_base
+        )
         prog4.progress(1.0, text="Baseline selesai")
 
     st.session_state["sgwrf"] = dict(
-        results=results, bw_results=bw_results, alpha_results=alpha_results, rf_results=rf_results,
+        results=results, spatial_results=spatial_results, rf_results=rf_results,
         best_k_geo=best_k_geo, best_alpha=best_alpha, best_gamma=best_gamma, best_rf=best_rf,
         overall_cv=overall_cv, overall_in=overall_in, importances=importances,
-        baseline_results=baseline_results, x_cols=x_cols, x_labels=x_labels,
-        name_col=name_col, id_col=id_col,
+        baseline_results=baseline_results, rf_global_tuning=rf_global_tuning, gwrf_tuning=gwrf_tuning,
+        x_cols=x_cols, x_labels=x_labels, name_col=name_col, id_col=id_col,
     )
     st.success("✅ Analisis SGWRF selesai! Lihat hasil pada tab lainnya.")
 
@@ -1035,13 +1081,12 @@ if run_button:
 state = st.session_state.get("sgwrf")
 
 if state is None:
-    for t in (tab_bw, tab_alpha, tab_rf, tab_local, tab_baseline, tab_download):
+    for t in (tab_spatial, tab_rf, tab_local, tab_baseline, tab_download):
         with t:
             st.info("⬅️ Atur parameter di sidebar lalu tekan **Jalankan Analisis SGWRF** untuk melihat hasil di sini.")
 else:
     results = state["results"]
-    bw_results = state["bw_results"]
-    alpha_results = state["alpha_results"]
+    spatial_results = state["spatial_results"]
     rf_results = state["rf_results"]
     best_k_geo = state["best_k_geo"]
     best_alpha = state["best_alpha"]
@@ -1051,6 +1096,8 @@ else:
     overall_in = state["overall_in"]
     importances = state["importances"]
     baseline_results = state["baseline_results"]
+    rf_global_tuning = state["rf_global_tuning"]
+    gwrf_tuning = state["gwrf_tuning"]
 
     # -------- peta hasil (tambahan di tab_map) --------
     with tab_map:
@@ -1107,89 +1154,71 @@ else:
                 f"beberapa kovariat di titik tersebut."
             )
 
-    # -------- tab bandwidth geografis --------
-    with tab_bw:
-        st.subheader("Optimasi Bandwidth Geografis Adaptif (k_geo)")
+    # -------- tab pencarian spasial (k_geo x alpha) --------
+    with tab_spatial:
+        st.subheader("Pencarian Bersama k_geo × α (Kriteria Utama: RMSE LOOCV)")
         st.markdown(
-            '<div class="sgwrf-eq">b_g(i) = jarak ke tetangga ke-k terdekat &nbsp;|&nbsp; '
-            'w_ij^G = exp[-(d_ij^G)² / (2·b_g²)] — Persamaan (2.10)-(2.11)</div>',
+            '<div class="sgwrf-eq">W_GS = α·W_G + γ·W_S, γ=1-α (2.24) &nbsp;|&nbsp; '
+            'alpha* = argmin RMSE_CV(k_geo, α) (2.32) &nbsp;|&nbsp; AICc = diagnostik tambahan (2.29)</div>',
             unsafe_allow_html=True,
         )
-        b1, b2 = st.columns(2)
-        b1.metric("k geografis optimum (k*)", best_k_geo)
-        b2.metric("RMSE CV minimum", f"{bw_results['RMSE_CV'].min():.4f}")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("k_geo optimum (k*)", best_k_geo)
+        s2.metric("alpha optimum (α*)", f"{best_alpha:.3f}")
+        s3.metric("gamma optimum (γ*)", f"{best_gamma:.3f}")
+        s4.metric("RMSE LOOCV minimum", f"{spatial_results['RMSE_CV'].min():.4f}")
 
-        fig_bw = px.line(bw_results.sort_values("k_geo"), x="k_geo", y="RMSE_CV", markers=True,
-                          title="RMSE-CV vs Bandwidth Geografis (k)")
-        fig_bw.add_vline(x=best_k_geo, line_dash="dash", line_color="#e74c3c",
-                          annotation_text=f"k*={best_k_geo}")
-        st.plotly_chart(fig_bw, use_container_width=True)
+        pivot = spatial_results.pivot_table(index="k_geo", columns="alpha", values="RMSE_CV", aggfunc="min")
+        fig_heat = px.imshow(pivot, color_continuous_scale="Viridis", aspect="auto",
+                              labels=dict(x="alpha", y="k_geo", color="RMSE LOOCV"),
+                              title="Peta Panas RMSE-LOOCV untuk Kombinasi k_geo × alpha")
+        fig_heat.update_traces(hovertemplate="alpha=%{x}<br>k_geo=%{y}<br>RMSE=%{z:.4f}<extra></extra>")
+        st.plotly_chart(fig_heat, use_container_width=True)
         note(
-            f"Setiap titik pada grafik adalah RMSE hasil validasi silang **leave-target-out** untuk satu "
-            f"nilai k (jumlah tetangga geografis terdekat yang dipakai membentuk bandwidth adaptif b_g). "
-            f"Titik terendah (garis merah putus-putus) adalah **k* = {best_k_geo}** yang dipilih otomatis. "
-            f"k kecil membuat model sangat lokal (risiko overfit pada data sedikit), k besar membuat "
-            f"bandwidth melebar sehingga model mendekati model global (kurang menangkap heterogenitas "
-            f"spasial). Nilai k_geo ini dipakai tetap pada tahap optimasi alpha berikutnya."
+            f"Setiap sel adalah RMSE hasil validasi silang **LOOCV** untuk satu kombinasi (k_geo, α). "
+            f"Warna **gelap/ungu** = error kecil (kombinasi lebih baik), warna **terang/kuning** = error "
+            f"besar. Kombinasi terbaik: **k_geo* = {best_k_geo}**, **α* = {best_alpha:.3f}** "
+            f"(γ* = {best_gamma:.3f}). k_geo kecil & α mendekati 1 membuat model sangat bergantung pada "
+            f"kedekatan geografis; α mendekati 0 membuat model lebih bergantung pada kemiripan atribut/"
+            f"kovariat antar titik. Kriteria pemilihan di sini murni **RMSE LOOCV terkecil** — AICc pada "
+            f"kurva di bawah hanya diagnostik tambahan, bukan penentu keputusan."
         )
-        st.dataframe(bw_results, use_container_width=True, height=280)
 
-    # -------- tab alpha / AICc --------
-    with tab_alpha:
-        st.subheader("Optimasi Bobot α · γ via AICc")
-        st.markdown(
-            '<div class="sgwrf-eq">W_GS = α·W_G + γ·W_S,  γ = 1-α — Persamaan (2.24)<br>'
-            'AICc = 2n·ln(RSS/n) + n·ln(2π) + n + 2(ENP+1)(ENP+2)/(n-ENP-2) — Persamaan (2.29)</div>',
-            unsafe_allow_html=True,
+        fig_aicc = px.line(
+            spatial_results[spatial_results["k_geo"] == best_k_geo].sort_values("alpha"),
+            x="alpha", y="AICc", markers=True,
+            title=f"AICc vs Alpha pada k_geo* = {best_k_geo} (diagnostik tambahan)"
         )
-        a1, a2, a3 = st.columns(3)
-        a1.metric("alpha optimum (α*)", f"{best_alpha:.3f}")
-        a2.metric("gamma optimum (γ*)", f"{best_gamma:.3f}")
-        a3.metric("AICc minimum", f"{alpha_results['AICc'].min():.2f}")
-
-        fig_a = px.line(alpha_results.sort_values("alpha"), x="alpha", y="AICc", markers=True,
-                         title="Kurva AICc terhadap Alpha")
-        fig_a.add_vline(x=best_alpha, line_dash="dash", line_color="#e74c3c",
-                         annotation_text=f"α*={best_alpha:.3f}")
-        st.plotly_chart(fig_a, use_container_width=True)
+        fig_aicc.add_vline(x=best_alpha, line_dash="dash", line_color="#e74c3c", annotation_text=f"α*={best_alpha:.3f}")
+        st.plotly_chart(fig_aicc, use_container_width=True)
         note(
-            f"**α* = {best_alpha:.3f}** berarti bobot geografis (W_G, kedekatan lokasi) berkontribusi "
-            f"**{best_alpha*100:.1f}%**, sedangkan bobot kemiripan atribut/kovariat (W_S) berkontribusi "
-            f"**{best_gamma*100:.1f}%** (γ* = {best_gamma:.3f}) dalam pembentukan bobot gabungan W_GS. "
-            f"AICc dipilih karena menyeimbangkan **kecocokan model** (RSS kecil) dengan **kompleksitas "
-            f"efektif model** (ENP = trace(S) — proksi jumlah parameter efektif, karena Random Forest "
-            f"tidak memiliki hat-matrix linear eksplisit seperti pada GWR klasik). Titik terendah pada "
-            f"kurva (garis merah) adalah kombinasi α-γ terbaik."
+            "AICc menyeimbangkan kecocokan model (RSS) dengan kompleksitas efektif (ENP = trace(S), "
+            "proksi karena Random Forest tidak memiliki hat-matrix linear eksplisit). Kurva ini diiris "
+            "pada k_geo* hasil pencarian RMSE-LOOCV — perhatikan apakah titik minimum AICc (jika ada) "
+            "kurang lebih sejalan dengan α* terpilih; jika berbeda jauh, ini sinyal untuk meninjau ulang "
+            "rentang pencarian alpha."
         )
 
-        fig_enp = px.line(alpha_results.sort_values("alpha"), x="alpha", y="ENP", markers=True,
-                           title="ENP (Kompleksitas Efektif Model) terhadap Alpha")
-        st.plotly_chart(fig_enp, use_container_width=True)
-        note(
-            "ENP (*Effective Number of Parameters*) menggambarkan seberapa fleksibel/kompleks model pada "
-            "tiap nilai alpha. ENP yang naik seiring perubahan alpha menunjukkan model menjadi lebih "
-            "fleksibel (berisiko overfit); AICc menghukum kenaikan ENP yang tidak diimbangi penurunan RSS "
-            "yang sepadan."
-        )
-        st.dataframe(alpha_results, use_container_width=True, height=280)
+        with st.expander("📋 Tabel lengkap seluruh kombinasi k_geo × alpha (diurutkan RMSE_CV)"):
+            st.dataframe(spatial_results, use_container_width=True, height=350)
 
     # -------- tab RF --------
     with tab_rf:
-        st.subheader("Optimasi Hyperparameter Random Forest")
+        st.subheader("Optimasi Hyperparameter Random Forest (Model Utama SGWRF)")
         st.json(best_rf)
         fig_rf = px.bar(rf_results.reset_index(), x="index", y="RMSE_CV",
-                         hover_data=["n_estimators", "max_features", "min_samples_leaf"],
-                         title="RMSE-CV per Konfigurasi Random Forest",
+                         hover_data=["n_estimators", "max_features", "min_samples_leaf", "max_depth"],
+                         title="RMSE-LOOCV per Konfigurasi Random Forest (12 kombinasi)",
                          labels={"index": "Konfigurasi"})
         st.plotly_chart(fig_rf, use_container_width=True)
         note(
-            f"Setiap batang adalah satu kombinasi hyperparameter Random Forest (jumlah pohon, "
-            f"`max_features`, `min_samples_leaf`) yang diuji lewat validasi silang lokal menggunakan bobot "
-            f"gabungan W_GS (α*, γ* dari tab sebelumnya). Batang **terendah** dipilih sebagai konfigurasi "
-            f"final: `max_features={best_rf.get('max_features')}`, "
-            f"`min_samples_leaf={best_rf.get('min_samples_leaf')}`. Konfigurasi ini lalu dipakai untuk "
-            f"melatih model lokal final dengan jumlah pohon yang lebih besar (lihat pengaturan sidebar) "
-            f"agar hasil akhir lebih stabil."
+            f"Setiap batang adalah satu dari **12 kombinasi** hyperparameter Random Forest (jumlah pohon, "
+            f"`max_features`, `min_samples_leaf`, `max_depth`) yang diuji lewat **LOOCV** menggunakan bobot "
+            f"gabungan W_GS (k_geo*, α* dari tab sebelumnya). Batang **terendah** dipilih sebagai "
+            f"konfigurasi final: `max_features={best_rf.get('max_features')}`, "
+            f"`min_samples_leaf={best_rf.get('min_samples_leaf')}`, `max_depth={best_rf.get('max_depth')}`. "
+            f"Konfigurasi ini lalu dipakai untuk melatih model lokal final dengan jumlah pohon yang lebih "
+            f"besar (lihat pengaturan sidebar) agar hasil akhir lebih stabil."
         )
         st.dataframe(rf_results, use_container_width=True)
 
@@ -1257,8 +1286,8 @@ else:
             "Kolom `pred_sgwrf_cv`/`residual_cv` adalah hasil **LOOCV** (evaluasi utama), sedangkan "
             "`pred_sgwrf` adalah prediksi **in-sample** dari model final. Kolom `bandwidth_geo_local` "
             "adalah bandwidth geografis adaptif b_g(i) di titik tersebut (dalam satuan derajat koordinat, "
-            "mengikuti Persamaan 2.10), sementara `alpha`/`gamma` adalah bobot α*/γ* global hasil optimasi "
-            "AICc yang berlaku untuk seluruh titik."
+            "mengikuti Persamaan 2.10), sementara `alpha`/`gamma` adalah bobot α*/γ* global hasil pencarian "
+            "bersama k_geo×α yang berlaku untuk seluruh titik."
         )
 
         st.subheader("Rata-rata Variable Importance (Seluruh Lokasi)")
@@ -1310,10 +1339,10 @@ else:
             st.markdown(
                 '<div class="sgwrf-note">Bandwidth geografis b_g(i) bersifat <b>lokal/adaptif</b> (berbeda '
                 'tiap titik, mengikuti kepadatan tetangganya), sedangkan α* dan γ* adalah bobot '
-                '<b>global</b> hasil optimasi AICc yang sama untuk semua titik pada Persamaan (2.24). '
-                'Model SGWRF utamanya adalah Random Forest lokal berbobot — bukan model linear, sehingga '
-                'tidak memiliki koefisien beta seperti GWR klasik. Ukuran kepentingan variabel yang sah '
-                'adalah treewise permutation importance (VI_ik) pada tabel di atas.</div>',
+                '<b>global</b> hasil pencarian bersama k_geo×α yang sama untuk semua titik pada Persamaan '
+                '(2.24). Model SGWRF utamanya adalah Random Forest lokal berbobot — bukan model linear, '
+                'sehingga tidak memiliki koefisien beta seperti GWR klasik. Ukuran kepentingan variabel '
+                'yang sah adalah treewise permutation importance (VI_ik) pada tabel di atas.</div>',
                 unsafe_allow_html=True,
             )
             st.dataframe(
@@ -1326,7 +1355,7 @@ else:
         if baseline_results is None:
             st.info("Model baseline tidak dijalankan. Aktifkan opsi di sidebar lalu jalankan ulang analisis.")
         else:
-            st.subheader("Perbandingan SGWRF vs Model Baseline")
+            st.subheader("Perbandingan SGWRF vs Model Baseline (semua LOOCV)")
             st.dataframe(baseline_results, use_container_width=True)
 
             fig_bar = make_subplots(rows=1, cols=2, subplot_titles=("RMSE (lebih rendah lebih baik)", "R² (lebih tinggi lebih baik)"))
@@ -1334,29 +1363,39 @@ else:
                                       marker_color="#e74c3c", name="RMSE"), row=1, col=1)
             fig_bar.add_trace(go.Bar(x=baseline_results["Model"], y=baseline_results["R2"],
                                       marker_color="#27ae60", name="R2"), row=1, col=2)
-            fig_bar.update_layout(height=430, showlegend=False, title="Ringkasan Kinerja Model (semua LOOCV kecuali RF global)")
+            fig_bar.update_layout(height=430, showlegend=False, title="Ringkasan Kinerja Model (semua LOOCV)")
             st.plotly_chart(fig_bar, use_container_width=True)
             sgwrf_rank = int((baseline_results["RMSE"] < overall_cv["RMSE"]).sum())
             posisi = "lebih baik dari seluruh" if sgwrf_rank == 0 else f"lebih baik dari {len(baseline_results)-sgwrf_rank} dari {len(baseline_results)}"
             note(
                 f"Model utama **SGWRF** (tab Model Lokal SGWRF) memiliki RMSE LOOCV **{overall_cv['RMSE']:.4f}** "
                 f"dan R² LOOCV **{overall_cv['R2']:.4f}** — dibandingkan baseline di atas, SGWRF saat ini "
-                f"{posisi} model pembanding. Baris **SGWRF (LOOCV)** pada tabel baseline memakai bobot dan "
-                f"skema LOOCV yang sama seperti model utama, sehingga nilainya seharusnya mendekati metrik "
-                f"LOOCV di tab Model Lokal SGWRF (perbedaan kecil dapat terjadi karena penyesuaian "
-                f"parameter/seed). Jika SGWRF **tidak** mengungguli GWRF/RF secara meyakinkan, pertimbangkan "
-                f"menambah kovariat relevan, menambah titik observasi, atau memperluas rentang pencarian "
-                f"bandwidth/alpha di sidebar."
+                f"{posisi} model pembanding. Baris **SGWRF** pada tabel baseline memakai hyperparameter RF "
+                f"yang **sama persis** dengan model utama, sehingga nilainya seharusnya mendekati metrik "
+                f"LOOCV di tab Model Lokal SGWRF (perbedaan kecil dapat terjadi karena seed acak). Sebaliknya "
+                f"**RF (global)** dan **GWRF** pada tabel ini di-tuning ULANG secara independen (grid 12 "
+                f"konfigurasi tersendiri), sehingga perbandingannya adil — masing-masing model dievaluasi "
+                f"pada kondisi hyperparameter terbaiknya sendiri. Jika SGWRF **tidak** mengungguli GWRF/RF "
+                f"secara meyakinkan, pertimbangkan menambah kovariat relevan, menambah titik observasi, atau "
+                f"memperluas rentang pencarian k_geo/alpha di sidebar."
             )
 
             st.markdown(
-                '<div class="sgwrf-note">Baseline: <b>RF</b> (Random Forest tanpa pembobotan lokal), '
-                '<b>GWR</b> (regresi linear terboboti W_G/geografis, LOOCV), <b>GWRF</b> (RF terboboti '
-                'W_G, LOOCV), <b>SGWR</b> (regresi linear terboboti W_GS = α·W_G+γ·W_S, LOOCV), '
-                '<b>SGWRF (LOOCV)</b> (RF terboboti W_GS, LOOCV — setara model utama). Semua bobot memakai '
-                'k_geo* dan α*/γ* hasil optimasi pada tab sebelumnya.</div>',
+                '<div class="sgwrf-note">Baseline: <b>RF (global)</b> (Random Forest tanpa pembobotan '
+                'lokal, di-tuning ulang), <b>GWR</b> (regresi linear terboboti W_G/geografis, LOOCV), '
+                '<b>GWRF</b> (RF terboboti W_G, di-tuning ulang, LOOCV), <b>SGWR</b> (regresi linear '
+                'terboboti W_GS = α·W_G+γ·W_S, LOOCV), <b>SGWRF</b> (RF terboboti W_GS memakai '
+                'hyperparameter model utama, LOOCV). Semua bobot memakai k_geo* dan α*/γ* hasil pencarian '
+                'bersama pada tab sebelumnya.</div>',
                 unsafe_allow_html=True,
             )
+
+            if rf_global_tuning is not None:
+                with st.expander("📋 Detail tuning RF (global) — 12 konfigurasi, LOOCV"):
+                    st.dataframe(rf_global_tuning, use_container_width=True, height=300)
+            if gwrf_tuning is not None:
+                with st.expander("📋 Detail tuning GWRF — 12 konfigurasi, LOOCV"):
+                    st.dataframe(gwrf_tuning, use_container_width=True, height=300)
 
     # -------- tab unduh --------
     with tab_download:
@@ -1369,31 +1408,38 @@ else:
         with dl1:
             st.download_button("⬇️ Hasil Lokal SGWRF (.csv)", to_csv_bytes(results),
                                 "hasil_lokal_sgwrf.csv", "text/csv", use_container_width=True)
-            st.download_button("⬇️ Optimasi Bandwidth Geografis (.csv)", to_csv_bytes(bw_results),
-                                "hasil_optimasi_bandwidth_geografis.csv", "text/csv", use_container_width=True)
+            st.download_button("⬇️ Pencarian k_geo × alpha (.csv)", to_csv_bytes(spatial_results),
+                                "hasil_optimasi_k_alpha_LOOCV.csv", "text/csv", use_container_width=True)
         with dl2:
-            st.download_button("⬇️ Optimasi Alpha / AICc (.csv)", to_csv_bytes(alpha_results),
-                                "hasil_optimasi_alpha_AICc.csv", "text/csv", use_container_width=True)
-            st.download_button("⬇️ Optimasi Random Forest (.csv)", to_csv_bytes(rf_results),
+            st.download_button("⬇️ Optimasi Random Forest — SGWRF (.csv)", to_csv_bytes(rf_results),
                                 "hasil_optimasi_rf.csv", "text/csv", use_container_width=True)
-        with dl3:
             vi_export = pd.DataFrame(importances, columns=state["x_cols"])
             vi_export.insert(0, "point_no", results["point_no"].to_numpy())
             st.download_button("⬇️ Local Variable Importance (.csv)", to_csv_bytes(vi_export),
                                 "local_variable_importance.csv", "text/csv", use_container_width=True)
+        with dl3:
             if baseline_results is not None:
                 st.download_button("⬇️ Perbandingan Model Baseline (.csv)", to_csv_bytes(baseline_results),
                                     "perbandingan_model.csv", "text/csv", use_container_width=True)
+                if rf_global_tuning is not None:
+                    st.download_button("⬇️ Tuning RF Global (.csv)", to_csv_bytes(rf_global_tuning),
+                                        "hasil_tuning_rf_global_LOOCV.csv", "text/csv", use_container_width=True)
+                if gwrf_tuning is not None:
+                    st.download_button("⬇️ Tuning GWRF (.csv)", to_csv_bytes(gwrf_tuning),
+                                        "hasil_tuning_gwrf_LOOCV.csv", "text/csv", use_container_width=True)
 
         excel_buf = io.BytesIO()
         with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
             results.to_excel(writer, sheet_name="hasil_lokal_sgwrf", index=False)
-            bw_results.to_excel(writer, sheet_name="optimasi_bandwidth_geo", index=False)
-            alpha_results.to_excel(writer, sheet_name="optimasi_alpha_AICc", index=False)
-            rf_results.to_excel(writer, sheet_name="optimasi_rf", index=False)
+            spatial_results.to_excel(writer, sheet_name="optimasi_k_alpha_LOOCV", index=False)
+            rf_results.to_excel(writer, sheet_name="optimasi_rf_sgwrf", index=False)
             vi_export.to_excel(writer, sheet_name="variable_importance", index=False)
             if baseline_results is not None:
                 baseline_results.to_excel(writer, sheet_name="perbandingan_baseline", index=False)
+            if rf_global_tuning is not None:
+                rf_global_tuning.to_excel(writer, sheet_name="tuning_rf_global", index=False)
+            if gwrf_tuning is not None:
+                gwrf_tuning.to_excel(writer, sheet_name="tuning_gwrf", index=False)
         st.download_button("⬇️ Semua Hasil (Excel, multi-sheet)", excel_buf.getvalue(),
                             "hasil_sgwrf_lengkap.xlsx",
                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1403,7 +1449,8 @@ st.markdown("---")
 st.caption(
     "Dashboard SGWRF — pipeline: standarisasi Z-score (2.3-2.5) → jarak geografis Euclidean (2.10) + "
     "kernel Gaussian adaptif (2.11) → jarak atribut mean|Z_i-Z_j| (2.18-2.19) + similarity weight (2.20) "
-    "→ kombinasi aditif W_GS = α·W_G + γ·W_S (2.24) → optimasi k_geo & alpha/gamma via AICc (2.28-2.33) → "
-    "optimasi hyperparameter RF → model lokal RF final per titik → treewise permutation importance (2.35) "
-    "→ evaluasi LOOCV (2.36-2.38) → model baseline pembanding (RF, GWR, GWRF, SGWR, SGWRF)."
+    "→ kombinasi aditif W_GS = α·W_G + γ·W_S (2.24) → pencarian BERSAMA k_geo & alpha via LOOCV, AICc "
+    "sebagai diagnostik tambahan (2.28-2.33) → optimasi hyperparameter RF (12 konfigurasi, LOOCV) → model "
+    "lokal RF final per titik → treewise permutation importance (2.35) → evaluasi LOOCV (2.36-2.38) → "
+    "model baseline pembanding (RF & GWRF di-tuning ulang; GWR, SGWR, SGWRF)."
 )
