@@ -418,6 +418,33 @@ def delete_checkpoint(path):
     except Exception:
         pass
 
+def save_stage_checkpoint(path, state):
+    """Atomic checkpoint untuk setiap tahap pipeline. Tidak bergantung pada session_state."""
+    if path is None:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    payload = {"version": CHECKPOINT_VERSION, "updated": time.time(), "state": state}
+    with tmp.open("wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+def load_stage_checkpoint(path):
+    if path is None or not Path(path).exists():
+        return None
+    try:
+        with Path(path).open("rb") as f:
+            payload = pickle.load(f)
+        if payload.get("version") != CHECKPOINT_VERSION:
+            return None
+        return payload.get("state")
+    except Exception:
+        return None
+
+def stage_path(prefix, key):
+    return CHECKPOINT_DIR / f"{prefix}_{key}.pkl"
+
 # ---------------- 1c. Pencarian BERSAMA k_geo x alpha x RF (kriteria utama: RMSE-LOOCV) ----------------
 
 def joint_optimize_sgwrf(X, y, d_geo, d_attr, cfg, rf_param_grid, progress_cb=None, checkpoint_path=None):
@@ -482,8 +509,8 @@ def joint_optimize_sgwrf(X, y, d_geo, d_attr, cfg, rf_param_grid, progress_cb=No
         raise
 
     results = pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True)
-    if checkpoint_path is not None:
-        delete_checkpoint(checkpoint_path)
+    # Jangan hapus checkpoint setelah selesai. Snapshot lengkap dipertahankan agar
+    # hasil/tahap dapat dipulihkan jika Streamlit restart sebelum state akhir tersimpan.
     return best, results, time.time() - t0
 
 
@@ -517,18 +544,14 @@ def local_treewise_variable_importance(model, X_train, y_train, sample_weight, s
     return importance
 
 
-def train_local_models(X, y, W, df, name_col, x_cols, x_labels, sgwrf_params, cfg, progress_cb=None):
-    """Model final per titik: TIDAK leave-target-out (bobot titik sendiri
-    ikut serta bila w_ii > 0). Jumlah pohon FINAL memakai cfg['rf_final_trees']
-    (independen dari n_estimators tahap pencarian LOOCV), sedangkan
-    max_features/min_samples_leaf/max_depth memakai hasil pencarian bersama."""
+def train_local_models(X, y, W, df, name_col, x_cols, x_labels, sgwrf_params, cfg, progress_cb=None, checkpoint_path=None):
+    """Model final per titik dengan checkpoint per titik dan resume."""
     n = len(y)
     p = X.shape[1]
     preds = np.full(n, np.nan)
     local_r2 = np.full(n, np.nan)
     local_mae = np.full(n, np.nan)
     local_rmse = np.full(n, np.nan)
-    importances = np.zeros((n, p))
 
     final_params = normalize_rf_params({
         "n_estimators": cfg["rf_final_trees"],
@@ -537,159 +560,175 @@ def train_local_models(X, y, W, df, name_col, x_cols, x_labels, sgwrf_params, cf
         "max_depth": sgwrf_params.get("max_depth", None),
     }, p)
 
-    for i in range(n):
-        w = W[i].copy()
-        train_mask = w > 1e-12
-        if train_mask.sum() < 4:
-            train_mask[:] = True
+    cp = load_stage_checkpoint(checkpoint_path)
+    if cp and cp.get("kind") == "local" and cp.get("n") == n and cp.get("p") == p:
+        preds = np.asarray(cp["preds"], dtype=float)
+        local_r2 = np.asarray(cp["local_r2"], dtype=float)
+        local_mae = np.asarray(cp["local_mae"], dtype=float)
+        local_rmse = np.asarray(cp["local_rmse"], dtype=float)
+        importances = np.asarray(cp["importances"], dtype=float)
+        completed = set(map(int, cp.get("completed", [])))
+        if progress_cb and completed:
+            progress_cb(len(completed)/n, f"Melanjutkan checkpoint model lokal: {len(completed)}/{n} titik selesai")
+    else:
+        importances = np.zeros((n, p))
+        completed = set()
 
-        model = RandomForestRegressor(
-            n_estimators=final_params["n_estimators"], max_features=final_params["max_features"],
-            min_samples_leaf=final_params["min_samples_leaf"], max_depth=final_params["max_depth"],
-            random_state=cfg["seed"] + i, n_jobs=int(cfg.get("rf_n_jobs", 1)),
-        )
-        model.fit(X[train_mask], y[train_mask], sample_weight=w[train_mask])
-        preds[i] = float(model.predict(X[i:i + 1])[0])
-
-        train_pred = model.predict(X[train_mask])
-        local_rmse[i] = float(np.sqrt(mean_squared_error(y[train_mask], train_pred, sample_weight=w[train_mask])))
-        local_mae[i] = float(mean_absolute_error(y[train_mask], train_pred, sample_weight=w[train_mask]))
-        try:
-            local_r2[i] = float(r2_score(y[train_mask], train_pred, sample_weight=w[train_mask]))
-        except Exception:
-            local_r2[i] = np.nan
-
-        importances[i, :] = local_treewise_variable_importance(
-            model, X[train_mask], y[train_mask], w[train_mask], cfg["seed"] + i
-        )
-
-        if progress_cb:
-            top_idx = int(np.argmax(importances[i]))
-            progress_cb((i + 1) / n, f"Titik {i+1}/{n} — {df.loc[i, name_col]} | dominan: {x_labels[x_cols[top_idx]]}")
-
+    try:
+        for i in range(n):
+            if i in completed:
+                continue
+            w = W[i].copy()
+            train_mask = w > 1e-12
+            if train_mask.sum() < 4:
+                train_mask[:] = True
+            model = RandomForestRegressor(
+                n_estimators=final_params["n_estimators"], max_features=final_params["max_features"],
+                min_samples_leaf=final_params["min_samples_leaf"], max_depth=final_params["max_depth"],
+                random_state=cfg["seed"] + i, n_jobs=int(cfg.get("rf_n_jobs", 1)),
+            )
+            model.fit(X[train_mask], y[train_mask], sample_weight=w[train_mask])
+            preds[i] = float(model.predict(X[i:i + 1])[0])
+            train_pred = model.predict(X[train_mask])
+            local_rmse[i] = float(np.sqrt(mean_squared_error(y[train_mask], train_pred, sample_weight=w[train_mask])))
+            local_mae[i] = float(mean_absolute_error(y[train_mask], train_pred, sample_weight=w[train_mask]))
+            try:
+                local_r2[i] = float(r2_score(y[train_mask], train_pred, sample_weight=w[train_mask]))
+            except Exception:
+                local_r2[i] = np.nan
+            importances[i, :] = local_treewise_variable_importance(model, X[train_mask], y[train_mask], w[train_mask], cfg["seed"] + i)
+            completed.add(i)
+            # checkpoint SETIAP titik agar kehilangan progres seminimal mungkin
+            save_stage_checkpoint(checkpoint_path, {
+                "kind":"local", "n":n, "p":p, "completed":sorted(completed),
+                "preds":preds, "local_r2":local_r2, "local_mae":local_mae,
+                "local_rmse":local_rmse, "importances":importances
+            })
+            if progress_cb:
+                top_idx = int(np.argmax(importances[i]))
+                progress_cb((len(completed))/n, f"Titik {i+1}/{n} — {df.loc[i, name_col]} | dominan: {x_labels[x_cols[top_idx]]} | checkpoint tersimpan")
+    except Exception:
+        save_stage_checkpoint(checkpoint_path, {
+            "kind":"local", "n":n, "p":p, "completed":sorted(completed),
+            "preds":preds, "local_r2":local_r2, "local_mae":local_mae,
+            "local_rmse":local_rmse, "importances":importances
+        })
+        raise
     return preds, local_r2, local_mae, local_rmse, importances
 
 
 # ---------------- 1e. Baseline: RF, GWR, GWRF, SGWR (masing-masing dituning sendiri), SGWRF (reuse) ----------------
 
-def optimize_global_rf(X, y, cfg, rf_param_grid, progress_cb=None):
-    """RF (global): RF_PARAM_GRID di-tuning ulang TANPA bobot spasial, LOOCV."""
-    rows, best = [], None
-    total = len(rf_param_grid)
-    for j, params in enumerate(rf_param_grid, 1):
-        preds = predict_global_rf_cv(X, y, params, cfg["seed"], 500000 + j * 1000)
-        m = metrics_dict(y, preds)
-        row = {"rf_config": j, **normalize_rf_params(params, X.shape[1]), **{f"{k}_CV": v for k, v in m.items()}}
-        rows.append(row)
-        if best is None or m["RMSE"] < best["RMSE_CV"]:
-            best = row.copy()
-            best["preds"] = preds.copy()
-            best["RMSE_CV"] = m["RMSE"]
-        if progress_cb:
-            progress_cb(j / total, f"RF global config {j}/{total} — RMSE_CV={m['RMSE']:.4f}")
-    return best, pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True)
+def _resume_rows_best(checkpoint_path, expected_kind):
+    cp=load_stage_checkpoint(checkpoint_path)
+    if cp and cp.get("kind")==expected_kind:
+        rows=cp.get("rows",[])
+        best=cp.get("best")
+        completed=set(cp.get("completed",[]))
+        return rows,best,completed
+    return [],None,set()
 
+def optimize_global_rf(X, y, cfg, rf_param_grid, progress_cb=None, checkpoint_path=None):
+    rows,best,completed=_resume_rows_best(checkpoint_path,"baseline_rf")
+    total=len(rf_param_grid)
+    try:
+        for j,params in enumerate(rf_param_grid,1):
+            if j in completed:
+                continue
+            preds=predict_global_rf_cv(X,y,params,cfg["seed"],500000+j*1000)
+            m=metrics_dict(y,preds)
+            row={"rf_config":j,**normalize_rf_params(params,X.shape[1]),**{f"{k}_CV":v for k,v in m.items()}}
+            rows.append(row)
+            if best is None or m["RMSE"]<best["RMSE_CV"]:
+                best=row.copy(); best["preds"]=preds.copy(); best["RMSE_CV"]=m["RMSE"]
+            completed.add(j)
+            save_stage_checkpoint(checkpoint_path,{"kind":"baseline_rf","rows":rows,"best":best,"completed":sorted(completed)})
+            if progress_cb: progress_cb(j/total,f"RF global config {j}/{total} — RMSE_CV={m['RMSE']:.4f} — checkpoint tersimpan")
+    except Exception:
+        save_stage_checkpoint(checkpoint_path,{"kind":"baseline_rf","rows":rows,"best":best,"completed":sorted(completed)})
+        raise
+    result=pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True)
+    return best,result
 
-def tune_gwr_k(X, y, d_geo, k_candidates, progress_cb=None):
-    """GWR: hanya k_geo yang dituning (regresi linear terboboti W_G), LOOCV."""
-    rows, best = [], None
-    total = len(k_candidates)
-    for idx, k in enumerate(k_candidates, 1):
-        bg = adaptive_bandwidth_matrix(d_geo, k)
-        Wg = gaussian_kernel(d_geo, bg[:, None])
-        pred = predict_weighted_linear_cv(X, y, Wg)
-        m = metrics_dict(y, pred)
-        row = {"k_geo": int(k), **{f"{a}_CV": b for a, b in m.items()}}
-        rows.append(row)
-        if best is None or m["RMSE"] < best["RMSE_CV"]:
-            best = row.copy()
-            best["preds"] = pred.copy()
-            best["RMSE_CV"] = m["RMSE"]
-        if progress_cb:
-            progress_cb(idx / total, f"GWR k_geo={k} ({idx}/{total}) — RMSE_CV={m['RMSE']:.4f}")
-    return best, pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True)
+def tune_gwr_k(X,y,d_geo,k_candidates,progress_cb=None,checkpoint_path=None):
+    rows,best,completed=_resume_rows_best(checkpoint_path,"baseline_gwr")
+    total=len(k_candidates)
+    try:
+        for idx,k in enumerate(k_candidates,1):
+            if idx in completed: continue
+            bg=adaptive_bandwidth_matrix(d_geo,k); Wg=gaussian_kernel(d_geo,bg[:,None])
+            pred=predict_weighted_linear_cv(X,y,Wg); m=metrics_dict(y,pred)
+            row={"k_geo":int(k),**{f"{a}_CV":b for a,b in m.items()}}; rows.append(row)
+            if best is None or m["RMSE"]<best["RMSE_CV"]:
+                best=row.copy(); best["preds"]=pred.copy(); best["RMSE_CV"]=m["RMSE"]
+            completed.add(idx); save_stage_checkpoint(checkpoint_path,{"kind":"baseline_gwr","rows":rows,"best":best,"completed":sorted(completed)})
+            if progress_cb: progress_cb(idx/total,f"GWR k_geo={k} ({idx}/{total}) — RMSE_CV={m['RMSE']:.4f} — checkpoint tersimpan")
+    except Exception:
+        save_stage_checkpoint(checkpoint_path,{"kind":"baseline_gwr","rows":rows,"best":best,"completed":sorted(completed)}); raise
+    result=pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True); return best,result
 
+def tune_gwrf(X,y,d_geo,k_candidates,rf_param_grid,cfg,progress_cb=None,checkpoint_path=None):
+    rows,best,completed=_resume_rows_best(checkpoint_path,"baseline_gwrf")
+    total=len(rf_param_grid)*len(k_candidates); counter=0
+    try:
+        for j,raw_params in enumerate(rf_param_grid,1):
+            params=normalize_rf_params(raw_params,X.shape[1])
+            for k in k_candidates:
+                counter+=1
+                if counter in completed: continue
+                bg=adaptive_bandwidth_matrix(d_geo,k); Wg=gaussian_kernel(d_geo,bg[:,None])
+                pred=predict_local_rf_cv(X,y,Wg,params,cfg["seed"],600000+j*1000+k,n_jobs=cfg.get("rf_n_jobs",1)); m=metrics_dict(y,pred)
+                row={"rf_config":j,"k_geo":k,**params,**{f"{a}_CV":b for a,b in m.items()}}; rows.append(row)
+                if best is None or m["RMSE"]<best["RMSE_CV"]:
+                    best=row.copy(); best["preds"]=pred.copy(); best["RMSE_CV"]=m["RMSE"]
+                completed.add(counter); save_stage_checkpoint(checkpoint_path,{"kind":"baseline_gwrf","rows":rows,"best":best,"completed":sorted(completed)})
+                if progress_cb and (counter%max(1,total//50)==0 or counter==total): progress_cb(counter/total,f"GWRF RF#{j} k={k} ({counter}/{total}) — RMSE_CV={m['RMSE']:.4f} — checkpoint tersimpan")
+    except Exception:
+        save_stage_checkpoint(checkpoint_path,{"kind":"baseline_gwrf","rows":rows,"best":best,"completed":sorted(completed)}); raise
+    result=pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True); return best,result
 
-def tune_gwrf(X, y, d_geo, k_candidates, rf_param_grid, cfg, progress_cb=None):
-    """GWRF: k_geo x RF_PARAM_GRID dituning BERSAMA (RF terboboti W_G saja), LOOCV."""
-    rows, best = [], None
-    total = len(rf_param_grid) * len(k_candidates)
-    counter = 0
-    for j, raw_params in enumerate(rf_param_grid, 1):
-        params = normalize_rf_params(raw_params, X.shape[1])
+def tune_sgwr(X,y,d_geo,d_attr,k_candidates,alpha_candidates,progress_cb=None,checkpoint_path=None):
+    rows,best,completed=_resume_rows_best(checkpoint_path,"baseline_sgwr")
+    total=len(k_candidates)*len(alpha_candidates); counter=0
+    try:
         for k in k_candidates:
-            counter += 1
-            bg = adaptive_bandwidth_matrix(d_geo, k)
-            Wg = gaussian_kernel(d_geo, bg[:, None])
-            pred = predict_local_rf_cv(X, y, Wg, params, cfg["seed"], 600000 + j * 1000 + k)
-            m = metrics_dict(y, pred)
-            row = {"rf_config": j, "k_geo": k, **params, **{f"{a}_CV": b for a, b in m.items()}}
-            rows.append(row)
-            if best is None or m["RMSE"] < best["RMSE_CV"]:
-                best = row.copy()
-                best["preds"] = pred.copy()
-                best["RMSE_CV"] = m["RMSE"]
-            if progress_cb and (counter % max(1, total // 50) == 0 or counter == total):
-                progress_cb(counter / total, f"GWRF RF#{j} k={k} ({counter}/{total}) — RMSE_CV={m['RMSE']:.4f}")
-    return best, pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True)
+            for alpha in alpha_candidates:
+                counter+=1
+                if counter in completed: continue
+                alpha=float(alpha); Wgs,*_=build_weight_components(d_geo,d_attr,k,alpha); pred=predict_weighted_linear_cv(X,y,Wgs); m=metrics_dict(y,pred)
+                row={"k_geo":k,"alpha":alpha,"gamma":1-alpha,**{f"{a}_CV":b for a,b in m.items()}}; rows.append(row)
+                if best is None or m["RMSE"]<best["RMSE_CV"]:
+                    best=row.copy(); best["preds"]=pred.copy(); best["RMSE_CV"]=m["RMSE"]
+                completed.add(counter); save_stage_checkpoint(checkpoint_path,{"kind":"baseline_sgwr","rows":rows,"best":best,"completed":sorted(completed)})
+                if progress_cb and (counter%max(1,total//50)==0 or counter==total): progress_cb(counter/total,f"SGWR k={k} α={alpha:.3f} ({counter}/{total}) — RMSE_CV={m['RMSE']:.4f} — checkpoint tersimpan")
+    except Exception:
+        save_stage_checkpoint(checkpoint_path,{"kind":"baseline_sgwr","rows":rows,"best":best,"completed":sorted(completed)}); raise
+    result=pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True); return best,result
 
 
-def tune_sgwr(X, y, d_geo, d_attr, k_candidates, alpha_candidates, progress_cb=None):
-    """SGWR: k_geo x alpha dituning BERSAMA (regresi linear terboboti W_GS), LOOCV."""
-    rows, best = [], None
-    total = len(k_candidates) * len(alpha_candidates)
-    counter = 0
-    for k in k_candidates:
-        for alpha in alpha_candidates:
-            counter += 1
-            alpha = float(alpha)
-            Wgs, *_ = build_weight_components(d_geo, d_attr, k, alpha)
-            pred = predict_weighted_linear_cv(X, y, Wgs)
-            m = metrics_dict(y, pred)
-            row = {"k_geo": k, "alpha": alpha, "gamma": 1 - alpha, **{f"{a}_CV": b for a, b in m.items()}}
-            rows.append(row)
-            if best is None or m["RMSE"] < best["RMSE_CV"]:
-                best = row.copy()
-                best["preds"] = pred.copy()
-                best["RMSE_CV"] = m["RMSE"]
-            if progress_cb and (counter % max(1, total // 50) == 0 or counter == total):
-                progress_cb(counter / total, f"SGWR k={k} α={alpha:.3f} ({counter}/{total}) — RMSE_CV={m['RMSE']:.4f}")
-    return best, pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True)
-
-
-def run_baselines(X, y, d_geo, d_attr, cfg, rf_param_grid, k_candidates, alpha_candidates,
-                   sgwrf_best_row, progress_cb=None):
-    """Semua baseline dievaluasi LOOCV. RF & GWRF di-tuning ulang secara
-    independen; GWR hanya menuning k_geo; SGWR menuning k_geo x alpha;
-    SGWRF memakai ulang hasil pencarian bersama utama (tanpa hitung ulang)."""
-
-    def sub(base, span):
-        def cb(frac, text):
-            if progress_cb:
-                progress_cb(base + span * frac, text)
+def run_baselines(X,y,d_geo,d_attr,cfg,rf_param_grid,k_candidates,alpha_candidates,sgwrf_best_row,progress_cb=None,checkpoint_prefix=None):
+    """Baseline dengan checkpoint terpisah untuk RF, GWR, GWRF, dan SGWR."""
+    def sub(base,span):
+        def cb(frac,text):
+            if progress_cb: progress_cb(base+span*frac,text)
         return cb
-
-    rf_best, rf_results = optimize_global_rf(X, y, cfg, rf_param_grid, progress_cb=sub(0.00, 0.15))
-    if progress_cb: progress_cb(0.15, "Baseline RF (global) selesai")
-
-    gwr_best, gwr_results = tune_gwr_k(X, y, d_geo, k_candidates, progress_cb=sub(0.15, 0.10))
-    if progress_cb: progress_cb(0.25, "Baseline GWR selesai")
-
-    gwrf_best, gwrf_results = tune_gwrf(X, y, d_geo, k_candidates, rf_param_grid, cfg, progress_cb=sub(0.25, 0.45))
-    if progress_cb: progress_cb(0.70, "Baseline GWRF selesai")
-
-    sgwr_best, sgwr_results = tune_sgwr(X, y, d_geo, d_attr, k_candidates, alpha_candidates, progress_cb=sub(0.70, 0.30))
-    if progress_cb: progress_cb(1.0, "Baseline SGWR selesai")
-
-    rows = [
-        {"Model": "RF (global, di-tuning ulang)", **metrics_dict(y, rf_best["preds"])},
-        {"Model": "GWR (k_geo dituning)", **metrics_dict(y, gwr_best["preds"])},
-        {"Model": "GWRF (k_geo × RF dituning)", **metrics_dict(y, gwrf_best["preds"])},
-        {"Model": "SGWR (k_geo × α dituning)", **metrics_dict(y, sgwr_best["preds"])},
-        {"Model": "SGWRF (hasil pencarian bersama utama)", **metrics_dict(y, sgwrf_best_row["preds"])},
+    prefix=checkpoint_prefix or "baseline"
+    rf_best,rf_results=optimize_global_rf(X,y,cfg,rf_param_grid,progress_cb=sub(0,.15),checkpoint_path=stage_path(prefix+"_rf",prefix))
+    if progress_cb: progress_cb(.15,"✅ Baseline RF selesai — checkpoint tahap tersimpan")
+    gwr_best,gwr_results=tune_gwr_k(X,y,d_geo,k_candidates,progress_cb=sub(.15,.10),checkpoint_path=stage_path(prefix+"_gwr",prefix))
+    if progress_cb: progress_cb(.25,"✅ Baseline GWR selesai — checkpoint tahap tersimpan")
+    gwrf_best,gwrf_results=tune_gwrf(X,y,d_geo,k_candidates,rf_param_grid,cfg,progress_cb=sub(.25,.45),checkpoint_path=stage_path(prefix+"_gwrf",prefix))
+    if progress_cb: progress_cb(.70,"✅ Baseline GWRF selesai — checkpoint tahap tersimpan")
+    sgwr_best,sgwr_results=tune_sgwr(X,y,d_geo,d_attr,k_candidates,alpha_candidates,progress_cb=sub(.70,.30),checkpoint_path=stage_path(prefix+"_sgwr",prefix))
+    if progress_cb: progress_cb(1.0,"✅ Baseline SGWR selesai — semua checkpoint baseline selesai")
+    rows=[
+        {"Model":"RF (global, di-tuning ulang)",**metrics_dict(y,rf_best["preds"])},
+        {"Model":"GWR (k_geo dituning)",**metrics_dict(y,gwr_best["preds"])},
+        {"Model":"GWRF (k_geo × RF dituning)",**metrics_dict(y,gwrf_best["preds"])},
+        {"Model":"SGWR (k_geo × α dituning)",**metrics_dict(y,sgwr_best["preds"])},
+        {"Model":"SGWRF (hasil pencarian bersama utama)",**metrics_dict(y,sgwrf_best_row["preds"])},
     ]
-    baseline_df = pd.DataFrame(rows).sort_values("RMSE").reset_index(drop=True)
-    return baseline_df, rf_results, gwr_results, gwrf_results, sgwr_results
+    return pd.DataFrame(rows).sort_values("RMSE").reset_index(drop=True),rf_results,gwr_results,gwrf_results,sgwr_results
 
 
 def build_results(df, id_col, name_col, lat_col, lon_col, y_col, x_cols, x_labels,
@@ -983,7 +1022,8 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    run_button = st.button("🚀 Jalankan Analisis SGWRF", use_container_width=True)
+    run_button = st.button("🚀 Jalankan / Lanjutkan Analisis SGWRF", use_container_width=True)
+    st.caption("Checkpoint aktif pada: joint search → model lokal per titik → baseline RF → GWR → GWRF → SGWR. Jika proses terputus, jalankan kembali dengan parameter/data yang sama untuk melanjutkan.")
 
 cfg = dict(min_k_geo=min_k_geo, max_k_geo=max_k_geo, alpha_min=float(alpha_min), alpha_max=float(alpha_max),
            n_alpha=int(n_alpha), rf_cv_trees=rf_cv_trees, rf_final_trees=rf_final_trees, seed=int(seed),
@@ -1183,9 +1223,11 @@ if run_button:
     prog3 = st.progress(0.0, text="Melatih model lokal SGWRF final per titik...")
     def cb_local(frac, text):
         prog3.progress(min(frac, 1.0), text=text)
+    local_cp = stage_path("local", cp_key)
     pred_in, local_r2, local_mae, local_rmse, importances = train_local_models(
-        X, y, Wgs, df, name_col, x_cols, x_labels, sgwrf_params, cfg, progress_cb=cb_local
+        X, y, Wgs, df, name_col, x_cols, x_labels, sgwrf_params, cfg, progress_cb=cb_local, checkpoint_path=local_cp
     )
+    # checkpoint lokal dipertahankan sebagai snapshot selesai.
     prog3.progress(1.0, text="Model lokal final selesai")
 
     overall_cv = metrics_dict(y, pred_cv)
@@ -1200,9 +1242,10 @@ if run_button:
         prog4 = st.progress(0.0, text="Menjalankan & men-tuning model baseline pembanding...")
         def cb_base(frac, text):
             prog4.progress(min(frac, 1.0), text=text)
+        baseline_prefix = f"baseline_{cp_key}"
         baseline_results, rf_global_results, gwr_results, gwrf_results, sgwr_results = run_baselines(
             X, y, d_geo, d_attr, cfg, RF_PARAM_GRID, k_candidates, alpha_candidates,
-            best_sgwrf, progress_cb=cb_base
+            best_sgwrf, progress_cb=cb_base, checkpoint_prefix=baseline_prefix
         )
         prog4.progress(1.0, text="Baseline selesai")
 
