@@ -236,15 +236,23 @@ section[data-testid="stSidebar"] [data-testid="stAlert"] *{
 
 /* ---------------- TABS ---------------- */
 .stTabs [data-baseweb="tab-list"]{gap:4px;}
-.stTabs [data-baseweb="tab"]{
-    background:#eef2f7 !important;border-radius:8px 8px 0 0;padding:8px 16px;font-weight:600;
-}
-.stTabs [data-baseweb="tab"] *{
-    color:#1a2733 !important;
+.stTabs [data-baseweb="tab-list"] button{
+    background-color:#eef2f7 !important;
+    border-radius:8px 8px 0 0;padding:8px 16px;font-weight:600;
     opacity:1 !important;
 }
-.stTabs [aria-selected="true"]{background:var(--sgwrf-primary) !important;}
-.stTabs [aria-selected="true"] *{color:#ffffff !important;}
+.stTabs [data-baseweb="tab-list"] button *{
+    color:#1a2733 !important;
+    fill:#1a2733 !important;
+    opacity:1 !important;
+}
+.stTabs [data-baseweb="tab-list"] button[aria-selected="true"]{
+    background-color:var(--sgwrf-primary) !important;
+}
+.stTabs [data-baseweb="tab-list"] button[aria-selected="true"] *{
+    color:#ffffff !important;
+    fill:#ffffff !important;
+}
 
 /* ---------------- KOTAK CUSTOM (spesifisitas tinggi agar selalu menang) ---------------- */
 div.sgwrf-banner{
