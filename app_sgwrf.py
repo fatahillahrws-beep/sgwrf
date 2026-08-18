@@ -153,21 +153,49 @@ section[data-testid="stSidebar"] small{
     opacity:1 !important;
 }
 /* Kotak input/dropdown/file-uploader tetap berlatar terang, sehingga
-   teks di DALAM kotak tersebut harus gelap agar terbaca jelas. */
-section[data-testid="stSidebar"] div[data-baseweb="select"],
-section[data-testid="stSidebar"] div[data-baseweb="select"] > div,
-section[data-testid="stSidebar"] div[data-baseweb="popover"],
-section[data-testid="stSidebar"] div[role="listbox"],
-section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzone"],
-section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"]{
-    background:#ffffff !important;border-radius:8px;
+   teks di DALAM kotak tersebut harus gelap agar terbaca jelas.
+   Pola: wadah luar diberi latar SOLID putih, semua elemen di dalamnya
+   dipaksa transparan + teks/ikon gelap — supaya tidak ada lapisan
+   gelap bawaan tema yang menimpa dari dalam. */
+section[data-testid="stSidebar"] div[data-baseweb="select"]{
+    background-color:#ffffff !important;border-radius:8px;
 }
-section[data-testid="stSidebar"] div[data-baseweb="select"] *,
+section[data-testid="stSidebar"] div[data-baseweb="select"] *{
+    background-color:transparent !important;
+    color:#1a2733 !important;
+    fill:#1a2733 !important;
+    opacity:1 !important;
+}
+section[data-testid="stSidebar"] div[data-baseweb="popover"],
+section[data-testid="stSidebar"] div[role="listbox"]{
+    background-color:#ffffff !important;
+}
 section[data-testid="stSidebar"] div[data-baseweb="popover"] *,
-section[data-testid="stSidebar"] div[role="listbox"] *,
-section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzone"] *,
+section[data-testid="stSidebar"] div[role="listbox"] *{
+    background-color:transparent !important;
+    color:#1a2733 !important;
+    opacity:1 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
+section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"],
+section[data-testid="stSidebar"] [data-testid="stFileUploader"] section{
+    background-color:#ffffff !important;border-radius:10px;
+}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
 section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzoneInstructions"] *,
 section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"] *,
+section[data-testid="stSidebar"] [data-testid="stFileUploader"] section *{
+    background-color:transparent !important;
+    color:#1a2733 !important;
+    fill:#1a2733 !important;
+    opacity:1 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button,
+section[data-testid="stSidebar"] [data-testid="stFileUploader"] button{
+    background-color:#ffffff !important;
+    color:#1a2733 !important;
+    border:1px solid #c9d3dc !important;
+}
 section[data-testid="stSidebar"] input,
 section[data-testid="stSidebar"] textarea{
     color:#1a2733 !important;
@@ -191,6 +219,19 @@ section[data-testid="stSidebar"] .stButton>button{
 section[data-testid="stSidebar"] [data-testid="stAlert"],
 section[data-testid="stSidebar"] [data-testid="stAlert"] *{
     color:#1a2733 !important;
+}
+
+/* ---------------- TOOLBAR STREAMLIT (ikon share/edit/comment dsb) ---------------- */
+[data-testid="stToolbar"],
+[data-testid="stToolbarActions"],
+[data-testid="stDecoration"]{
+    background-color:#ffffff !important;
+}
+[data-testid="stToolbar"] *,
+[data-testid="stToolbarActions"] *{
+    color:#1a2733 !important;
+    fill:#1a2733 !important;
+    opacity:1 !important;
 }
 
 /* ---------------- TABS ---------------- */
