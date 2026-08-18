@@ -45,6 +45,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 
 from scipy.spatial.distance import cdist
@@ -54,6 +55,12 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 warnings.filterwarnings("ignore")
+
+# Paksa semua grafik Plotly (px & go) memakai template terang secara
+# global — mencegah latar chart menjadi hitam/gelap saat Streamlit
+# memakai tema Dark (paper/plot background tidak lagi ikut warna gelap
+# bawaan, dan font otomatis gelap agar tetap terbaca).
+pio.templates.default = "plotly_white"
 
 # ================================================================
 # 0. KONFIGURASI HALAMAN & GAYA TAMPILAN
@@ -74,42 +81,63 @@ CUSTOM_CSS = """
     /* Override variabel tema Streamlit sendiri (dipakai banyak widget
        bawaan) supaya konsisten LIGHT walau pengguna memilih tema
        "Dark" di menu Settings Streamlit atau OS-nya memakai dark mode. */
-    --background-color:#ffffff;
-    --secondary-background-color:#f5f7fa;
-    --text-color:#1a2733;
-    --primary-color:#0f4c81;
+    --background-color:#ffffff !important;
+    --secondary-background-color:#f5f7fa !important;
+    --text-color:#1a2733 !important;
+    --primary-color:#0f4c81 !important;
 }
 
 /* ------------------------------------------------------------
-   FIX TEMA GELAP: paksa area utama tetap terang + teks gelap,
-   apa pun preferensi tema Streamlit/OS pengguna. Tanpa ini,
-   kotak custom (note/interpret/eq) berlatar terang bisa memakai
-   warna teks terang bawaan tema dark → teks jadi tidak terbaca.
+   FIX TEMA GELAP: paksa area utama & sidebar tetap terang + teks
+   gelap, apa pun preferensi tema Streamlit/OS pengguna. Beberapa
+   selector fallback disertakan karena testid Streamlit bisa berbeda
+   antar versi/deployment (mis. Streamlit Community Cloud).
    ------------------------------------------------------------ */
-[data-testid="stAppViewContainer"]{
+html, body,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stHeader"],
+.stApp,
+.appview-container,
+section.main{
     background-color:#ffffff !important;
 }
-[data-testid="stHeader"]{
-    background-color:#ffffff !important;
-}
-.main .block-container{
+.main .block-container,
+.main .block-container p,
+.main .block-container span,
+.main .block-container label,
+.main .block-container li,
+.main .block-container div[data-testid="stMarkdownContainer"]{
     color:#1a2733 !important;
+    opacity:1 !important;
 }
+h1,h2,h3,h4,h5,h6{color:var(--sgwrf-primary) !important;opacity:1 !important;}
 div[data-testid="stMetric"] *{
-    color:#1a2733;
+    color:#1a2733 !important;
 }
 div[data-testid="stMetricValue"]{
     color:var(--sgwrf-primary) !important;
     font-weight:700;
 }
+/* Kartu grafik Plotly: paksa latar putih supaya tidak ada kotak hitam
+   di sekitar judul/chart saat tema Dark aktif. */
+div[data-testid="stPlotlyChart"]{
+    background:#ffffff !important;border-radius:10px;overflow:hidden;
+}
 
 .main .block-container{padding-top:1.4rem;padding-bottom:2.5rem;max-width:1400px;}
-h1,h2,h3{color:var(--sgwrf-primary);}
 div[data-testid="stMetric"]{
     background:white;border:1px solid #e3e8ee;border-radius:12px;
     padding:0.7rem 0.9rem;box-shadow:0 1px 3px rgba(15,76,129,0.08);
 }
-section[data-testid="stSidebar"]{background:#0f4c81;}
+
+/* ---------------- SIDEBAR ---------------- */
+section[data-testid="stSidebar"],
+section[data-testid="stSidebar"] > div,
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"],
+section[data-testid="stSidebar"] [data-testid="stSidebarContent"]{
+    background-color:#0f4c81 !important;
+}
 /* Teks label, judul, dan keterangan di sidebar dibuat terang agar kontras
    dengan latar biru gelap. */
 section[data-testid="stSidebar"] label,
@@ -121,10 +149,19 @@ section[data-testid="stSidebar"] h3,
 section[data-testid="stSidebar"] .stMarkdown,
 section[data-testid="stSidebar"] .stCaption,
 section[data-testid="stSidebar"] small{
-    color:#eef4fb;
+    color:#eef4fb !important;
+    opacity:1 !important;
 }
 /* Kotak input/dropdown/file-uploader tetap berlatar terang, sehingga
    teks di DALAM kotak tersebut harus gelap agar terbaca jelas. */
+section[data-testid="stSidebar"] div[data-baseweb="select"],
+section[data-testid="stSidebar"] div[data-baseweb="select"] > div,
+section[data-testid="stSidebar"] div[data-baseweb="popover"],
+section[data-testid="stSidebar"] div[role="listbox"],
+section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzone"],
+section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"]{
+    background:#ffffff !important;border-radius:8px;
+}
 section[data-testid="stSidebar"] div[data-baseweb="select"] *,
 section[data-testid="stSidebar"] div[data-baseweb="popover"] *,
 section[data-testid="stSidebar"] div[role="listbox"] *,
@@ -134,49 +171,62 @@ section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"] *,
 section[data-testid="stSidebar"] input,
 section[data-testid="stSidebar"] textarea{
     color:#1a2733 !important;
-}
-section[data-testid="stSidebar"] div[data-baseweb="select"] > div{
-    background:#ffffff;border-radius:8px;
-}
-section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzone"],
-section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"]{
-    background:#ffffff;border-radius:10px;
+    opacity:1 !important;
 }
 /* Placeholder / teks bantu ("Choose an option", nama file terunggah, dsb.) */
 section[data-testid="stSidebar"] div[data-baseweb="select"] div[class*="placeholder"]{
     color:#5a6b7a !important;
 }
+/* Tag terpilih pada multiselect (mis. daftar kovariat X) */
+section[data-testid="stSidebar"] span[data-baseweb="tag"]{
+    background-color:var(--sgwrf-accent) !important;
+}
+section[data-testid="stSidebar"] span[data-baseweb="tag"] *{
+    color:#20242b !important;
+}
 section[data-testid="stSidebar"] .stButton>button{
     background:var(--sgwrf-accent);color:#20242b !important;font-weight:700;
     border:none;border-radius:8px;
 }
-.stTabs [data-baseweb="tab-list"]{gap:4px;}
-.stTabs [data-baseweb="tab"]{
-    background:#eef2f7;border-radius:8px 8px 0 0;padding:8px 16px;font-weight:600;
+section[data-testid="stSidebar"] [data-testid="stAlert"],
+section[data-testid="stSidebar"] [data-testid="stAlert"] *{
     color:#1a2733 !important;
 }
-.stTabs [aria-selected="true"]{background:var(--sgwrf-primary);color:white !important;}
-.sgwrf-banner{
-    background:linear-gradient(90deg,#0f4c81,#1c7ed6);
-    color:white;padding:1.1rem 1.4rem;border-radius:14px;margin-bottom:1.1rem;
+
+/* ---------------- TABS ---------------- */
+.stTabs [data-baseweb="tab-list"]{gap:4px;}
+.stTabs [data-baseweb="tab"]{
+    background:#eef2f7 !important;border-radius:8px 8px 0 0;padding:8px 16px;font-weight:600;
 }
-.sgwrf-banner h1{color:white;margin:0;font-size:1.55rem;}
-.sgwrf-banner p{color:#dbe9fb;margin:0.2rem 0 0 0;font-size:0.92rem;}
-.sgwrf-note{
-    background:#fff8e6;border-left:4px solid var(--sgwrf-accent);
-    padding:0.6rem 0.9rem;border-radius:6px;font-size:0.88rem;color:#5c4813;
+.stTabs [data-baseweb="tab"] *{
+    color:#1a2733 !important;
+    opacity:1 !important;
 }
-.sgwrf-interpret{
-    background:#eef6ff;border-left:4px solid #1c7ed6;color:#123a5c;
+.stTabs [aria-selected="true"]{background:var(--sgwrf-primary) !important;}
+.stTabs [aria-selected="true"] *{color:#ffffff !important;}
+
+/* ---------------- KOTAK CUSTOM (spesifisitas tinggi agar selalu menang) ---------------- */
+div.sgwrf-banner{
+    background:linear-gradient(90deg,#0f4c81,#1c7ed6) !important;
+    color:white !important;padding:1.1rem 1.4rem;border-radius:14px;margin-bottom:1.1rem;
+}
+div.sgwrf-banner h1{color:#ffffff !important;margin:0;font-size:1.55rem;opacity:1 !important;}
+div.sgwrf-banner p{color:#dbe9fb !important;margin:0.2rem 0 0 0;font-size:0.92rem;opacity:1 !important;}
+div.sgwrf-note{
+    background:#fff8e6 !important;border-left:4px solid var(--sgwrf-accent);
+    padding:0.6rem 0.9rem;border-radius:6px;font-size:0.88rem;color:#5c4813 !important;
+}
+div.sgwrf-interpret{
+    background:#eef6ff !important;border-left:4px solid #1c7ed6;color:#123a5c !important;
     padding:0.55rem 0.9rem;border-radius:6px;font-size:0.87rem;margin:0.35rem 0 1.1rem 0;
 }
-.sgwrf-interpret b{color:#0f4c81;}
-.sgwrf-eq{
-    background:#f4f6fb;border:1px dashed #9db3c9;border-radius:8px;
-    padding:0.5rem 0.8rem;font-family:"Courier New",monospace;font-size:0.85rem;color:#0f4c81;
+div.sgwrf-interpret b{color:#0f4c81 !important;}
+div.sgwrf-eq{
+    background:#f4f6fb !important;border:1px dashed #9db3c9;border-radius:8px;
+    padding:0.5rem 0.8rem;font-family:"Courier New",monospace;font-size:0.85rem;color:#0f4c81 !important;
 }
-.sgwrf-warn{
-    background:#fdecea;border-left:4px solid #e74c3c;color:#7a1f14;
+div.sgwrf-warn{
+    background:#fdecea !important;border-left:4px solid #e74c3c;color:#7a1f14 !important;
     padding:0.6rem 0.9rem;border-radius:6px;font-size:0.88rem;
 }
 </style>
