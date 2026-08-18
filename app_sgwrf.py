@@ -1,44 +1,10 @@
-# ================================================================
-# SGWRF INTERACTIVE DASHBOARD
-# Semi-parametric Geographically Weighted Random Forest
-# ----------------------------------------------------------------
-# Mengikuti persamaan pada proposal (2.3)-(2.38):
-#   (2.3)-(2.5)   Standarisasi kovariat (Z-score)
-#   (2.10)        Jarak geografis Euclidean d_ij^G
-#   (2.11)        Kernel Gaussian geografis w_ij^G = exp[-(d^G)^2 / 2b_g^2]
-#   (2.18)-(2.19) Jarak atribut d_ij = mean_k |z_ik - z_jk|
-#   (2.20)        Similarity weight w_ij^S = exp(-d_ij^2)
-#   (2.24)        W_GS = alpha * W_G + gamma * W_S,  gamma = 1 - alpha
-#   (2.28)-(2.33) k_geo, alpha/gamma, DAN hyperparameter RF dicari SEKALIGUS
-#                 (joint search) berdasarkan RMSE LOOCV; AICc hanya
-#                 diagnostik tambahan (ENP = trace(S), proxy), BUKAN
-#                 kriteria pemilihan
-#   (2.35)        Treewise permutation variable importance
-#   (2.36)-(2.38) RMSE, MAPE, R2 (evaluasi utama memakai LOOCV)
-#
-# Model baseline (semua LOOCV):
-#   - RF (global)  : RF_PARAM_GRID di-tuning ulang tanpa bobot spasial
-#   - GWR          : hanya k_geo yang dituning (regresi linear terboboti W_G)
-#   - GWRF         : k_geo x RF_PARAM_GRID dituning bersama (RF terboboti W_G)
-#   - SGWR         : k_geo x alpha dituning bersama (regresi linear terboboti W_GS)
-#   - SGWRF        : memakai hasil pencarian bersama k_geo x alpha x RF
-#                    (preds sudah tersedia dari tahap joint search utama,
-#                    TIDAK dihitung ulang)
-#
-# Data TIDAK di-hardcode — pengguna mengunggah file sendiri (xlsx/csv),
-# memetakan kolom, mengatur parameter, lalu menjalankan seluruh pipeline.
-# Peta & grafik interaktif (Plotly) otomatis menyesuaikan data yang
-# diunggah, termasuk saat jumlah titik observasi bertambah.
-#
-# Jalankan dengan:
-#   pip install -r requirements.txt
-#   streamlit run sgwrf_dashboard.py
-# ================================================================
-
 import io
 import json
 import time
 import warnings
+import hashlib
+import pickle
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -56,11 +22,9 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 warnings.filterwarnings("ignore")
 
-# Paksa semua grafik Plotly (px & go) memakai template terang secara
-# global — mencegah latar chart menjadi hitam/gelap saat Streamlit
-# memakai tema Dark (paper/plot background tidak lagi ikut warna gelap
-# bawaan, dan font otomatis gelap agar tetap terbaca).
-pio.templates.default = "plotly_white"
+# Tema dashboard mengikuti dark mode pengguna.
+# Semua grafik Plotly dibuat gelap agar konsisten dengan laptop/OS bertema dark.
+pio.templates.default = "plotly_dark"
 
 # ================================================================
 # 0. KONFIGURASI HALAMAN & GAYA TAMPILAN
@@ -75,209 +39,113 @@ st.set_page_config(
 CUSTOM_CSS = """
 <style>
 :root, .stApp{
-    --sgwrf-primary:#0f4c81;
-    --sgwrf-accent:#f39c12;
-    --sgwrf-bg:#f5f7fa;
-    /* Override variabel tema Streamlit sendiri (dipakai banyak widget
-       bawaan) supaya konsisten LIGHT walau pengguna memilih tema
-       "Dark" di menu Settings Streamlit atau OS-nya memakai dark mode. */
-    --background-color:#ffffff !important;
-    --secondary-background-color:#f5f7fa !important;
-    --text-color:#1a2733 !important;
-    --primary-color:#0f4c81 !important;
+    --sgwrf-bg:#0e1117;
+    --sgwrf-panel:#161b22;
+    --sgwrf-panel2:#1c2128;
+    --sgwrf-border:#30363d;
+    --sgwrf-text:#e6edf3;
+    --sgwrf-muted:#9da7b3;
+    --sgwrf-primary:#58a6ff;
+    --sgwrf-accent:#f2cc60;
 }
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"], section.main{
+    background:#0e1117 !important; color:var(--sgwrf-text) !important;
+}
+[data-testid="stHeader"]{background:rgba(14,17,23,.92) !important;}
+.main .block-container{padding-top:1.2rem;padding-bottom:2.5rem;max-width:1450px;}
+.main .block-container p, .main .block-container span, .main .block-container label,
+.main .block-container li, .main .block-container div[data-testid="stMarkdownContainer"]{
+    color:var(--sgwrf-text) !important; opacity:1 !important;
+}
+h1,h2,h3,h4,h5,h6{color:#f0f6fc !important; opacity:1 !important;}
+.stCaption, [data-testid="stCaptionContainer"]{color:var(--sgwrf-muted) !important;}
 
-/* ------------------------------------------------------------
-   FIX TEMA GELAP: paksa area utama & sidebar tetap terang + teks
-   gelap, apa pun preferensi tema Streamlit/OS pengguna. Beberapa
-   selector fallback disertakan karena testid Streamlit bisa berbeda
-   antar versi/deployment (mis. Streamlit Community Cloud).
-   ------------------------------------------------------------ */
-html, body,
-[data-testid="stAppViewContainer"],
-[data-testid="stMain"],
-[data-testid="stHeader"],
-.stApp,
-.appview-container,
-section.main{
-    background-color:#ffffff !important;
+/* Header */
+div.sgwrf-banner{
+    background:linear-gradient(135deg,#111827,#0b3b6f 55%,#145ea8) !important;
+    border:1px solid #24476a; color:#fff !important; padding:1.15rem 1.4rem;
+    border-radius:16px; margin-bottom:1rem; box-shadow:0 8px 30px rgba(0,0,0,.22);
 }
-.main .block-container,
-.main .block-container p,
-.main .block-container span,
-.main .block-container label,
-.main .block-container li,
-.main .block-container div[data-testid="stMarkdownContainer"]{
-    color:#1a2733 !important;
-    opacity:1 !important;
-}
-h1,h2,h3,h4,h5,h6{color:var(--sgwrf-primary) !important;opacity:1 !important;}
-div[data-testid="stMetric"] *{
-    color:#1a2733 !important;
-}
-div[data-testid="stMetricValue"]{
-    color:var(--sgwrf-primary) !important;
-    font-weight:700;
-}
-/* Kartu grafik Plotly: paksa latar putih supaya tidak ada kotak hitam
-   di sekitar judul/chart saat tema Dark aktif. */
-div[data-testid="stPlotlyChart"]{
-    background:#ffffff !important;border-radius:10px;overflow:hidden;
-}
+div.sgwrf-banner h1{color:#fff !important;margin:0;font-size:1.65rem;}
+div.sgwrf-banner p{color:#c9d8e8 !important;margin:.35rem 0 0;font-size:.92rem;line-height:1.55;}
 
-.main .block-container{padding-top:1.4rem;padding-bottom:2.5rem;max-width:1400px;}
+/* Metrics */
 div[data-testid="stMetric"]{
-    background:white;border:1px solid #e3e8ee;border-radius:12px;
-    padding:0.7rem 0.9rem;box-shadow:0 1px 3px rgba(15,76,129,0.08);
+    background:#161b22 !important;border:1px solid var(--sgwrf-border) !important;
+    border-radius:12px;padding:.7rem .9rem;box-shadow:0 4px 14px rgba(0,0,0,.16);
 }
+div[data-testid="stMetric"] *{color:#e6edf3 !important;}
+div[data-testid="stMetricValue"]{color:#58a6ff !important;font-weight:800;}
+div[data-testid="stMetricLabel"]{color:#9da7b3 !important;}
 
-/* ---------------- SIDEBAR ---------------- */
-section[data-testid="stSidebar"],
-section[data-testid="stSidebar"] > div,
-section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"],
-section[data-testid="stSidebar"] [data-testid="stSidebarContent"]{
-    background-color:#0f4c81 !important;
+/* Sidebar */
+section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div,
+section[data-testid="stSidebar"] [data-testid="stSidebarContent"],
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"]{
+    background:#11161d !important;
 }
-/* Teks label, judul, dan keterangan di sidebar dibuat terang agar kontras
-   dengan latar biru gelap. */
-section[data-testid="stSidebar"] label,
-section[data-testid="stSidebar"] p,
-section[data-testid="stSidebar"] span:not([data-baseweb] *),
-section[data-testid="stSidebar"] h1,
-section[data-testid="stSidebar"] h2,
-section[data-testid="stSidebar"] h3,
-section[data-testid="stSidebar"] .stMarkdown,
-section[data-testid="stSidebar"] .stCaption,
-section[data-testid="stSidebar"] small{
-    color:#eef4fb !important;
-    opacity:1 !important;
-}
-/* Kotak input/dropdown/file-uploader tetap berlatar terang, sehingga
-   teks di DALAM kotak tersebut harus gelap agar terbaca jelas.
-   Pola: wadah luar diberi latar SOLID putih, semua elemen di dalamnya
-   dipaksa transparan + teks/ikon gelap — supaya tidak ada lapisan
-   gelap bawaan tema yang menimpa dari dalam. */
-section[data-testid="stSidebar"] div[data-baseweb="select"]{
-    background-color:#ffffff !important;border-radius:8px;
-}
-section[data-testid="stSidebar"] div[data-baseweb="select"] *{
-    background-color:transparent !important;
-    color:#1a2733 !important;
-    fill:#1a2733 !important;
-    opacity:1 !important;
-}
-section[data-testid="stSidebar"] div[data-baseweb="popover"],
-section[data-testid="stSidebar"] div[role="listbox"]{
-    background-color:#ffffff !important;
-}
-section[data-testid="stSidebar"] div[data-baseweb="popover"] *,
-section[data-testid="stSidebar"] div[role="listbox"] *{
-    background-color:transparent !important;
-    color:#1a2733 !important;
-    opacity:1 !important;
-}
+section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] small,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]{color:#e6edf3 !important;}
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
-section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"],
-section[data-testid="stSidebar"] [data-testid="stFileUploader"] section{
-    background-color:#ffffff !important;border-radius:10px;
+section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"]{
+    background:#161b22 !important;border:1px dashed #3d4650 !important;border-radius:10px !important;
 }
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
-section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzoneInstructions"] *,
-section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"] *,
-section[data-testid="stSidebar"] [data-testid="stFileUploader"] section *{
-    background-color:transparent !important;
-    color:#1a2733 !important;
-    fill:#1a2733 !important;
-    opacity:1 !important;
+section[data-testid="stSidebar"] section[data-testid="stFileUploadDropzone"] *{
+    color:#c9d1d9 !important; fill:#c9d1d9 !important; background:transparent !important;
 }
-section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button,
-section[data-testid="stSidebar"] [data-testid="stFileUploader"] button{
-    background-color:#ffffff !important;
-    color:#1a2733 !important;
-    border:1px solid #c9d3dc !important;
-}
-section[data-testid="stSidebar"] input,
-section[data-testid="stSidebar"] textarea{
-    color:#1a2733 !important;
-    opacity:1 !important;
-}
-/* Placeholder / teks bantu ("Choose an option", nama file terunggah, dsb.) */
-section[data-testid="stSidebar"] div[data-baseweb="select"] div[class*="placeholder"]{
-    color:#5a6b7a !important;
-}
-/* Tag terpilih pada multiselect (mis. daftar kovariat X) */
-section[data-testid="stSidebar"] span[data-baseweb="tag"]{
-    background-color:var(--sgwrf-accent) !important;
-}
-section[data-testid="stSidebar"] span[data-baseweb="tag"] *{
-    color:#20242b !important;
-}
+section[data-testid="stSidebar"] div[data-baseweb="select"]{background:#161b22 !important;border:1px solid #30363d !important;border-radius:8px;}
+section[data-testid="stSidebar"] div[data-baseweb="select"] *{background:transparent !important;color:#e6edf3 !important;fill:#e6edf3 !important;}
+section[data-testid="stSidebar"] div[data-baseweb="popover"], section[data-testid="stSidebar"] div[role="listbox"]{background:#161b22 !important;}
+section[data-testid="stSidebar"] div[data-baseweb="popover"] *, section[data-testid="stSidebar"] div[role="listbox"] *{color:#e6edf3 !important;background:transparent !important;}
+section[data-testid="stSidebar"] input, section[data-testid="stSidebar"] textarea{color:#e6edf3 !important;background:#161b22 !important;}
+section[data-testid="stSidebar"] span[data-baseweb="tag"]{background:#264f78 !important;}
+section[data-testid="stSidebar"] span[data-baseweb="tag"] *{color:#e6edf3 !important;}
 section[data-testid="stSidebar"] .stButton>button{
-    background:var(--sgwrf-accent);color:#20242b !important;font-weight:700;
-    border:none;border-radius:8px;
-}
-section[data-testid="stSidebar"] [data-testid="stAlert"],
-section[data-testid="stSidebar"] [data-testid="stAlert"] *{
-    color:#1a2733 !important;
+    background:#f2cc60 !important;color:#11161d !important;font-weight:800;
+    border:none;border-radius:9px;min-height:2.7rem;
 }
 
-/* ---------------- TOOLBAR STREAMLIT (ikon share/edit/comment dsb) ---------------- */
-[data-testid="stToolbar"],
-[data-testid="stToolbarActions"],
-[data-testid="stDecoration"]{
-    background-color:#ffffff !important;
-}
-[data-testid="stToolbar"] *,
-[data-testid="stToolbarActions"] *{
-    color:#1a2733 !important;
-    fill:#1a2733 !important;
-    opacity:1 !important;
-}
-
-/* ---------------- TABS ---------------- */
-.stTabs [data-baseweb="tab-list"]{gap:4px;}
+/* Tabs */
+.stTabs [data-baseweb="tab-list"]{gap:5px;border-bottom:1px solid #30363d;}
 .stTabs [data-baseweb="tab-list"] button{
-    background-color:#eef2f7 !important;
-    border-radius:8px 8px 0 0;padding:8px 16px;font-weight:600;
-    opacity:1 !important;
+    background:#161b22 !important;border:1px solid #30363d !important;border-bottom:none !important;
+    border-radius:9px 9px 0 0;padding:9px 15px;font-weight:650;
 }
-.stTabs [data-baseweb="tab-list"] button *{
-    color:#1a2733 !important;
-    fill:#1a2733 !important;
-    opacity:1 !important;
-}
-.stTabs [data-baseweb="tab-list"] button[aria-selected="true"]{
-    background-color:var(--sgwrf-primary) !important;
-}
-.stTabs [data-baseweb="tab-list"] button[aria-selected="true"] *{
-    color:#ffffff !important;
-    fill:#ffffff !important;
-}
+.stTabs [data-baseweb="tab-list"] button *{color:#c9d1d9 !important;fill:#c9d1d9 !important;}
+.stTabs [data-baseweb="tab-list"] button[aria-selected="true"]{background:#1f6feb !important;}
+.stTabs [data-baseweb="tab-list"] button[aria-selected="true"] *{color:#fff !important;fill:#fff !important;}
 
-/* ---------------- KOTAK CUSTOM (spesifisitas tinggi agar selalu menang) ---------------- */
-div.sgwrf-banner{
-    background:linear-gradient(90deg,#0f4c81,#1c7ed6) !important;
-    color:white !important;padding:1.1rem 1.4rem;border-radius:14px;margin-bottom:1.1rem;
-}
-div.sgwrf-banner h1{color:#ffffff !important;margin:0;font-size:1.55rem;opacity:1 !important;}
-div.sgwrf-banner p{color:#dbe9fb !important;margin:0.2rem 0 0 0;font-size:0.92rem;opacity:1 !important;}
+/* Tables / expanders / alerts */
+div[data-testid="stDataFrame"]{border:1px solid #30363d !important;border-radius:10px;overflow:hidden;}
+div[data-testid="stExpander"]{background:#161b22 !important;border:1px solid #30363d !important;border-radius:10px;}
+div[data-testid="stAlert"]{border-radius:10px;}
+
+/* Custom cards */
 div.sgwrf-note{
-    background:#fff8e6 !important;border-left:4px solid var(--sgwrf-accent);
-    padding:0.6rem 0.9rem;border-radius:6px;font-size:0.88rem;color:#5c4813 !important;
+    background:#2a2413 !important;border-left:4px solid #f2cc60;
+    padding:.65rem .9rem;border-radius:7px;font-size:.88rem;color:#f0e2b5 !important;
 }
 div.sgwrf-interpret{
-    background:#eef6ff !important;border-left:4px solid #1c7ed6;color:#123a5c !important;
-    padding:0.55rem 0.9rem;border-radius:6px;font-size:0.87rem;margin:0.35rem 0 1.1rem 0;
+    background:#10263b !important;border-left:4px solid #58a6ff;color:#c9e2ff !important;
+    padding:.6rem .9rem;border-radius:7px;font-size:.87rem;margin:.35rem 0 1.1rem;line-height:1.5;
 }
-div.sgwrf-interpret b{color:#0f4c81 !important;}
+div.sgwrf-interpret b{color:#79c0ff !important;}
 div.sgwrf-eq{
-    background:#f4f6fb !important;border:1px dashed #9db3c9;border-radius:8px;
-    padding:0.5rem 0.8rem;font-family:"Courier New",monospace;font-size:0.85rem;color:#0f4c81 !important;
+    background:#161b22 !important;border:1px dashed #46515d;border-radius:8px;
+    padding:.55rem .8rem;font-family:"Courier New",monospace;font-size:.84rem;color:#79c0ff !important;
 }
 div.sgwrf-warn{
-    background:#fdecea !important;border-left:4px solid #e74c3c;color:#7a1f14 !important;
-    padding:0.6rem 0.9rem;border-radius:6px;font-size:0.88rem;
+    background:#351a1c !important;border-left:4px solid #f85149;color:#ffb4ab !important;
+    padding:.65rem .9rem;border-radius:7px;font-size:.87rem;line-height:1.5;
 }
+
+/* Plotly */
+div[data-testid="stPlotlyChart"]{background:#0e1117 !important;border-radius:10px;overflow:hidden;}
+
+/* Toolbar */
+[data-testid="stToolbar"], [data-testid="stToolbarActions"]{background:#0e1117 !important;}
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -402,7 +270,7 @@ def normalize_rf_params(params, n_features):
     return out
 
 
-def rf_fit_predict(X_train, y_train, X_test, sample_weight, params, random_state):
+def rf_fit_predict(X_train, y_train, X_test, sample_weight, params, random_state, n_jobs=1):
     params = normalize_rf_params(params, X_train.shape[1])
     model = RandomForestRegressor(
         n_estimators=params["n_estimators"],
@@ -416,7 +284,7 @@ def rf_fit_predict(X_train, y_train, X_test, sample_weight, params, random_state
     return model, model.predict(X_test)
 
 
-def local_prediction_for_target(i, X, y, W, params, random_state, leave_target_out=True):
+def local_prediction_for_target(i, X, y, W, params, random_state, leave_target_out=True, n_jobs=1):
     w = np.asarray(W[i], dtype=float).copy()
     if leave_target_out:
         w[i] = 0.0
@@ -425,16 +293,16 @@ def local_prediction_for_target(i, X, y, W, params, random_state, leave_target_o
         train_mask[:] = True
         if leave_target_out:
             train_mask[i] = False
-    model, pred = rf_fit_predict(X[train_mask], y[train_mask], X[i:i + 1], w[train_mask], params, random_state)
+    model, pred = rf_fit_predict(X[train_mask], y[train_mask], X[i:i + 1], w[train_mask], params, random_state, n_jobs=n_jobs)
     return model, float(pred[0]), train_mask, w
 
 
-def predict_local_rf_cv(X, y, W, params, base_seed, seed_offset):
+def predict_local_rf_cv(X, y, W, params, base_seed, seed_offset, n_jobs=1):
     """LOOCV untuk Random Forest lokal berbobot — dipakai di seluruh tahap
     optimasi/seleksi maupun baseline (GWRF)."""
     preds = np.full(len(y), np.nan)
     for i in range(len(y)):
-        _, pred, _, _ = local_prediction_for_target(i, X, y, W, params, base_seed + seed_offset + i, True)
+        _, pred, _, _ = local_prediction_for_target(i, X, y, W, params, base_seed + seed_offset + i, True, n_jobs=n_jobs)
         preds[i] = pred
     return preds
 
@@ -465,7 +333,7 @@ def predict_global_rf_cv(X, y, params, base_seed, seed_offset):
         model = RandomForestRegressor(
             n_estimators=pnorm["n_estimators"], max_features=pnorm["max_features"],
             min_samples_leaf=pnorm["min_samples_leaf"], max_depth=pnorm["max_depth"],
-            random_state=base_seed + seed_offset + i, n_jobs=-1,
+            random_state=base_seed + seed_offset + i, n_jobs=1,
         )
         model.fit(X[mask], y[mask])
         preds[i] = float(model.predict(X[i:i + 1])[0])
@@ -505,61 +373,117 @@ def metrics_dict(y, pred):
     return {"RMSE": rmse, "MAE": mae, "MAPE": mape, "R2": r2, "RSS": rss}
 
 
-def cv_score_weight_matrix(W, X, y, params, base_seed, seed_offset):
-    preds = predict_local_rf_cv(X, y, W, params, base_seed, seed_offset)
+def cv_score_weight_matrix(W, X, y, params, base_seed, seed_offset, n_jobs=1):
+    preds = predict_local_rf_cv(X, y, W, params, base_seed, seed_offset, n_jobs=n_jobs)
     m = metrics_dict(y, preds)
     return m["RSS"], m["RMSE"], preds, m
 
 
+# ---------------- Checkpoint & resume ----------------
+CHECKPOINT_DIR = Path(".sgwrf_checkpoints")
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_VERSION = 2
+
+def checkpoint_key(uploaded_name, n_rows, id_col, name_col, lat_col, lon_col, y_col, x_cols, cfg, rf_grid):
+    payload = {
+        "version": CHECKPOINT_VERSION, "file": uploaded_name, "n_rows": int(n_rows),
+        "id": str(id_col), "name": str(name_col), "lat": str(lat_col), "lon": str(lon_col),
+        "y": str(y_col), "x": list(map(str, x_cols)),
+        "cfg": {k: cfg[k] for k in ("min_k_geo", "max_k_geo", "alpha_min", "alpha_max", "n_alpha", "rf_cv_trees", "seed")},
+        "rf_grid": rf_grid,
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+def save_checkpoint(path, rows, best):
+    tmp = Path(str(path) + ".tmp")
+    payload = {"version": CHECKPOINT_VERSION, "rows": rows, "best": best, "updated": time.time()}
+    with tmp.open("wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+def load_checkpoint(path):
+    try:
+        with Path(path).open("rb") as f:
+            payload = pickle.load(f)
+        if payload.get("version") != CHECKPOINT_VERSION:
+            return [], None
+        return payload.get("rows", []), payload.get("best")
+    except Exception:
+        return [], None
+
+def delete_checkpoint(path):
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
 # ---------------- 1c. Pencarian BERSAMA k_geo x alpha x RF (kriteria utama: RMSE-LOOCV) ----------------
 
-def joint_optimize_sgwrf(X, y, d_geo, d_attr, cfg, rf_param_grid, progress_cb=None):
-    """Pencarian ekspansif k_geo x alpha x hyperparameter RF (Persamaan
-    2.28-2.33). Kriteria utama = RMSE LOOCV; AICc dihitung sebagai
-    diagnostik tambahan saja, BUKAN kriteria pemilihan utama. Hanya
-    prediksi kombinasi TERBAIK yang disimpan (mengikuti script asli),
-    bukan seluruh kombinasi, agar hemat memori."""
+def joint_optimize_sgwrf(X, y, d_geo, d_attr, cfg, rf_param_grid, progress_cb=None, checkpoint_path=None):
+    """Pencarian bersama k_geo × alpha × RF dengan LOOCV + checkpoint/resume.
+    Kriteria utama tetap RMSE LOOCV; AICc hanya diagnostik tambahan."""
     k_candidates = candidate_geo_bandwidths(len(y), cfg["min_k_geo"], cfg["max_k_geo"])
     alpha_candidates = np.round(np.linspace(cfg["alpha_min"], cfg["alpha_max"], cfg["n_alpha"]), 4)
-
-    rows = []
-    best = None
-    t0 = time.time()
     total = len(rf_param_grid) * len(k_candidates) * len(alpha_candidates)
+    rows, best = [], None
+    completed = set()
+    if checkpoint_path is not None and Path(checkpoint_path).exists():
+        rows, best = load_checkpoint(checkpoint_path)
+        completed = {int(r.get("iteration", -1)) for r in rows}
+        if progress_cb and completed:
+            progress_cb(len(completed) / total, f"Melanjutkan checkpoint: {len(completed)}/{total} kombinasi sudah selesai")
+
+    t0 = time.time()
     iteration = 0
+    try:
+        for rf_id, base_params in enumerate(rf_param_grid, 1):
+            params = normalize_rf_params(base_params, X.shape[1])
+            for k_geo in k_candidates:
+                for alpha in alpha_candidates:
+                    iteration += 1
+                    if iteration in completed:
+                        if progress_cb and (iteration % max(1, total // 100) == 0 or iteration == total):
+                            progress_cb(iteration / total, f"Checkpoint: melewati kombinasi {iteration}/{total}")
+                        continue
+                    alpha = float(alpha)
+                    W, Wg, Ws, bg_local, gamma = build_weight_components(d_geo, d_attr, k_geo, alpha)
+                    rss, rmse, preds, m = cv_score_weight_matrix(
+                        W, X, y, params, cfg["seed"],
+                        rf_id * 100000 + k_geo * 1000 + int(round(alpha * 1000)),
+                        n_jobs=cfg.get("rf_n_jobs", 1),
+                    )
+                    enp = effective_number_parameters(W)
+                    aicc = aicc_from_rss(rss, len(y), enp)
+                    row = {
+                        "iteration": iteration, "rf_config": rf_id, "k_geo": int(k_geo),
+                        "alpha": alpha, "gamma": float(gamma),
+                        "n_estimators": int(params["n_estimators"]), "max_features": params["max_features"],
+                        "min_samples_leaf": int(params["min_samples_leaf"]), "max_depth": params["max_depth"],
+                        "RSS_CV": rss, "RMSE_CV": rmse, "MAE_CV": m["MAE"], "R2_CV": m["R2"], "MAPE_CV": m["MAPE"],
+                        "ENP_proxy": enp, "AICc_diagnostic": aicc,
+                    }
+                    rows.append(row)
+                    if best is None or rmse < best["RMSE_CV"]:
+                        best = row.copy()
+                        best["preds"] = preds.copy()
 
-    for rf_id, base_params in enumerate(rf_param_grid, 1):
-        params = normalize_rf_params(base_params, X.shape[1])
-        for k_geo in k_candidates:
-            for alpha in alpha_candidates:
-                iteration += 1
-                alpha = float(alpha)
-                W, Wg, Ws, bg_local, gamma = build_weight_components(d_geo, d_attr, k_geo, alpha)
-                rss, rmse, preds, m = cv_score_weight_matrix(
-                    W, X, y, params, cfg["seed"],
-                    rf_id * 100000 + k_geo * 1000 + int(round(alpha * 1000)),
-                )
-                enp = effective_number_parameters(W)
-                aicc = aicc_from_rss(rss, len(y), enp)
-                row = {
-                    "iteration": iteration, "rf_config": rf_id, "k_geo": int(k_geo),
-                    "alpha": alpha, "gamma": float(gamma),
-                    "n_estimators": int(params["n_estimators"]), "max_features": params["max_features"],
-                    "min_samples_leaf": int(params["min_samples_leaf"]), "max_depth": params["max_depth"],
-                    "RSS_CV": rss, "RMSE_CV": rmse, "MAE_CV": m["MAE"], "R2_CV": m["R2"], "MAPE_CV": m["MAPE"],
-                    "ENP_proxy": enp, "AICc_diagnostic": aicc,
-                }
-                rows.append(row)
-                if best is None or rmse < best["RMSE_CV"]:
-                    best = row.copy()
-                    best["preds"] = preds.copy()
+                    # Simpan checkpoint secara berkala agar tidak mengulang dari nol.
+                    if checkpoint_path is not None and (len(rows) % int(cfg.get("checkpoint_every", 5)) == 0 or iteration == total):
+                        save_checkpoint(checkpoint_path, rows, best)
 
-                if progress_cb and (iteration % max(1, total // 200) == 0 or iteration == total):
-                    progress_cb(iteration / total,
-                                f"[{iteration}/{total}] RF#{rf_id} k={k_geo} α={alpha:.3f} — "
-                                f"RMSE_CV={rmse:.4f} | terbaik={best['RMSE_CV']:.4f}")
+                    if progress_cb and (iteration % max(1, total // 100) == 0 or iteration == total):
+                        progress_cb(iteration / total,
+                                    f"[{iteration}/{total}] RF#{rf_id} • k={k_geo} • α={alpha:.3f} • "
+                                    f"RMSE={rmse:.4f} • terbaik={best['RMSE_CV']:.4f}")
+    except Exception:
+        if checkpoint_path is not None:
+            save_checkpoint(checkpoint_path, rows, best)
+        raise
 
     results = pd.DataFrame(rows).sort_values("RMSE_CV").reset_index(drop=True)
+    if checkpoint_path is not None:
+        delete_checkpoint(checkpoint_path)
     return best, results, time.time() - t0
 
 
@@ -622,7 +546,7 @@ def train_local_models(X, y, W, df, name_col, x_cols, x_labels, sgwrf_params, cf
         model = RandomForestRegressor(
             n_estimators=final_params["n_estimators"], max_features=final_params["max_features"],
             min_samples_leaf=final_params["min_samples_leaf"], max_depth=final_params["max_depth"],
-            random_state=cfg["seed"] + i, n_jobs=-1,
+            random_state=cfg["seed"] + i, n_jobs=int(cfg.get("rf_n_jobs", 1)),
         )
         model.fit(X[train_mask], y[train_mask], sample_weight=w[train_mask])
         preds[i] = float(model.predict(X[i:i + 1])[0])
@@ -922,12 +846,10 @@ def note(text):
     st.markdown(f'<div class="sgwrf-interpret">🔍 <b>Interpretasi:</b> {text}</div>', unsafe_allow_html=True)
 
 
-def data_fingerprint(uploaded_name, n_rows, id_col, name_col, lat_col, lon_col, y_col, x_cols):
-    """Sidik jari konfigurasi data + pemetaan kolom saat ini. Dipakai untuk
-    mendeteksi jika pengguna mengunggah data baru / menambah titik / mengubah
-    pemetaan kolom, sehingga hasil analisis lama (session_state) otomatis
-    dianggap kedaluwarsa dan tidak tercampur dengan data baru."""
-    return (uploaded_name, n_rows, id_col, name_col, lat_col, lon_col, y_col, tuple(sorted(x_cols)))
+def data_fingerprint(uploaded_name, n_rows, id_col, name_col, lat_col, lon_col, y_col, x_cols, data_hash=""):
+    """Sidik jari data + pemetaan kolom. Nilai data ikut di-hash sehingga
+    perubahan isi file dengan jumlah baris yang sama tetap dianggap data baru."""
+    return (uploaded_name, n_rows, id_col, name_col, lat_col, lon_col, y_col, tuple(sorted(x_cols)), data_hash)
 
 
 def build_rf_param_grid(rf_cv_trees):
@@ -1031,24 +953,29 @@ with st.sidebar:
     total_combo = n_k_geo * n_alpha * n_rf_grid
     est_search = total_combo * n_points
     st.markdown(
-        f'<div class="sgwrf-warn">⏱️ Total kombinasi pencarian utama: '
-        f'<b>{n_k_geo} (k_geo) × {n_alpha} (α) × {n_rf_grid} (RF) = {total_combo:,}</b>, '
-        f'≈ <b>{est_search:,} pelatihan model</b> RF berbobot (LOOCV) untuk {n_points} titik data. '
-        'Jika baseline diaktifkan, GWRF (k_geo×RF) dan SGWR (k_geo×α) menambah waktu komputasi lagi. '
-        'Persempit rentang k_geo / kurangi titik grid alpha / kurangi jumlah pohon jika terasa lambat.</div>',
+        f'<div class="sgwrf-warn">⏱️ <b>Beban komputasi:</b> {n_k_geo} k_geo × {n_alpha} α × {n_rf_grid} RF = '
+        f'<b>{total_combo:,} kombinasi</b>, sekitar <b>{est_search:,} fitting RF</b> untuk {n_points} titik (LOOCV). '
+        'Checkpoint aktif agar proses dapat dilanjutkan jika terputus.</div>',
         unsafe_allow_html=True,
     )
-
     st.subheader("4️⃣ Parameter Random Forest")
     rf_cv_trees = st.slider("Jumlah pohon (tahap pencarian/CV, berlaku utk 8 konfigurasi RF)", 20, 200, 60, step=10)
-    rf_final_trees = st.slider("Jumlah pohon (model final)", 100, 1000, 500, step=50,
+    rf_final_trees = st.slider("Jumlah pohon (model final)", 100, 1000, 300, step=50,
                                 help="Treewise permutation importance (Pers. 2.35) dihitung untuk SETIAP "
                                      "pohon di model final — makin banyak pohon, makin lama waktu komputasi.")
     seed = st.number_input("Random seed", 0, 99999, 2026)
+    rf_n_jobs = st.select_slider(
+        "CPU untuk Random Forest", options=[1, 2, 4], value=1,
+        help="1 paling aman untuk Streamlit Cloud; 2/4 dapat dipilih jika dijalankan di laptop dengan CPU yang cukup."
+    )
+    checkpoint_every = st.slider(
+        "Simpan checkpoint setiap N kombinasi", 1, 25, 5, step=1,
+        help="Jika proses terputus, pencarian dapat dilanjutkan dari checkpoint terakhir tanpa mengulang semuanya."
+    )
 
     st.subheader("5️⃣ Analisis Tambahan")
     run_baseline_flag = st.checkbox(
-        "Jalankan model baseline (RF, GWR, GWRF, SGWR, SGWRF)", value=True,
+        "Jalankan model baseline (RF, GWR, GWRF, SGWR, SGWRF)", value=False,
         help="RF di-tuning ulang (8 konfigurasi), GWR menuning k_geo, GWRF menuning k_geo×RF (8 "
              "konfigurasi), SGWR menuning k_geo×α — semuanya di luar pencarian utama, sehingga "
              "menambah waktu komputasi cukup signifikan. SGWRF memakai ulang hasil pencarian utama "
@@ -1059,7 +986,8 @@ with st.sidebar:
     run_button = st.button("🚀 Jalankan Analisis SGWRF", use_container_width=True)
 
 cfg = dict(min_k_geo=min_k_geo, max_k_geo=max_k_geo, alpha_min=float(alpha_min), alpha_max=float(alpha_max),
-           n_alpha=int(n_alpha), rf_cv_trees=rf_cv_trees, rf_final_trees=rf_final_trees, seed=int(seed))
+           n_alpha=int(n_alpha), rf_cv_trees=rf_cv_trees, rf_final_trees=rf_final_trees, seed=int(seed),
+           rf_n_jobs=int(rf_n_jobs), checkpoint_every=int(checkpoint_every))
 
 RF_PARAM_GRID = build_rf_param_grid(rf_cv_trees)
 
@@ -1091,7 +1019,8 @@ n_after = len(df)
 # saat pipeline dijalankan ulang — dashboard selalu mengikuti data
 # yang sedang aktif, berapa pun jumlah titiknya.
 # ----------------------------------------------------------------
-fp = data_fingerprint(uploaded.name, n_after, id_col, name_col, lat_col, lon_col, y_col, x_cols)
+data_hash = hashlib.sha256(pd.util.hash_pandas_object(df, index=True).values.tobytes()).hexdigest()[:24]
+fp = data_fingerprint(uploaded.name, n_after, id_col, name_col, lat_col, lon_col, y_col, x_cols, data_hash)
 if st.session_state.get("sgwrf_fp") != fp:
     if "sgwrf" in st.session_state:
         del st.session_state["sgwrf"]
@@ -1109,8 +1038,7 @@ if st.session_state.get("sgwrf_prev_n") is not None and st.session_state["sgwrf_
 st.session_state["sgwrf_prev_n"] = n_after
 
 tab_data, tab_map, tab_joint, tab_rf_summary, tab_local, tab_baseline, tab_download = st.tabs(
-    ["📊 Data & Eksplorasi", "🗺️ Peta Interaktif", "🎯 Pencarian Bersama (k_geo × α × RF)",
-     "🌲 Ringkasan Konfigurasi RF", "📈 Model Lokal SGWRF", "🆚 Perbandingan Baseline", "📥 Unduh Hasil"]
+    ["📊 Data", "🗺️ Peta", "🎯 Optimasi", "🌲 RF", "📈 Model SGWRF", "🆚 Baseline", "📥 Unduh"]
 )
 
 # ---------------- TAB: DATA & EKSPLORASI ----------------
@@ -1229,12 +1157,15 @@ if run_button:
     k_candidates = candidate_geo_bandwidths(len(y), cfg["min_k_geo"], cfg["max_k_geo"])
     alpha_candidates = np.round(np.linspace(cfg["alpha_min"], cfg["alpha_max"], cfg["n_alpha"]), 4)
 
-    # --- 1) Pencarian BERSAMA k_geo x alpha x RF (kriteria: RMSE LOOCV) ---
-    prog = st.progress(0.0, text="Pencarian bersama k_geo × alpha × RF (LOOCV)...")
+    # --- 1) Pencarian BERSAMA k_geo x alpha x RF + checkpoint/resume ---
+    cp_key = checkpoint_key(uploaded.name, n_after, id_col, name_col, lat_col, lon_col, y_col, x_cols, cfg, RF_PARAM_GRID)
+    checkpoint_path = CHECKPOINT_DIR / f"joint_{cp_key}.pkl"
+    has_cp = checkpoint_path.exists()
+    prog = st.progress(0.0, text=("Melanjutkan pencarian dari checkpoint..." if has_cp else "Memulai pencarian bersama k_geo × α × RF..."))
     def cb_joint(frac, text):
         prog.progress(min(frac, 1.0), text=text)
     best_sgwrf, joint_results, elapsed_j = joint_optimize_sgwrf(
-        X, y, d_geo, d_attr, cfg, RF_PARAM_GRID, progress_cb=cb_joint
+        X, y, d_geo, d_attr, cfg, RF_PARAM_GRID, progress_cb=cb_joint, checkpoint_path=checkpoint_path
     )
     best_k_geo = int(best_sgwrf["k_geo"])
     best_alpha = float(best_sgwrf["alpha"])
@@ -1368,7 +1299,7 @@ else:
 
     # -------- tab pencarian bersama k_geo x alpha x RF --------
     with tab_joint:
-        st.subheader("Pencarian Bersama k_geo × α × RF (Kriteria Utama: RMSE LOOCV)")
+        st.subheader("🎯 Optimasi Bersama k_geo × α × RF")
         st.markdown(
             '<div class="sgwrf-eq">W_GS = α·W_G + γ·W_S, γ=1-α (2.24) &nbsp;|&nbsp; '
             '(k*, α*, RF*) = argmin RMSE_CV(k_geo, α, RF) (2.32) &nbsp;|&nbsp; AICc = diagnostik tambahan (2.29)</div>',
@@ -1379,7 +1310,11 @@ else:
         s2.metric("alpha optimum (α*)", f"{best_alpha:.3f}")
         s3.metric("gamma optimum (γ*)", f"{best_gamma:.3f}")
         s4.metric("RMSE LOOCV minimum", f"{joint_results['RMSE_CV'].min():.4f}")
-        st.json(sgwrf_params)
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Trees CV", sgwrf_params["n_estimators"])
+        p2.metric("Max features", str(sgwrf_params["max_features"]))
+        p3.metric("Min leaf", sgwrf_params["min_samples_leaf"])
+        p4.metric("Max depth", "None" if sgwrf_params["max_depth"] is None else sgwrf_params["max_depth"])
 
         best_rf_id = int(joint_results.loc[joint_results["RMSE_CV"].idxmin(), "rf_config"])
         pivot = joint_results[joint_results["rf_config"] == best_rf_id].pivot_table(
@@ -1418,7 +1353,7 @@ else:
 
     # -------- tab ringkasan konfigurasi RF (diagregasi dari hasil pencarian bersama) --------
     with tab_rf_summary:
-        st.subheader("Ringkasan Konfigurasi RF dari Pencarian Bersama")
+        st.subheader("🌲 Ringkasan Konfigurasi Random Forest")
         st.caption(
             "Karena hyperparameter RF kini dicari BERSAMA k_geo & alpha (bukan tahap terpisah), tab ini "
             "hanya meringkas hasil pencarian bersama tersebut per konfigurasi RF — tidak ada komputasi "
@@ -1445,7 +1380,7 @@ else:
 
     # -------- tab model lokal --------
     with tab_local:
-        st.subheader("Kinerja Model SGWRF — Evaluasi Utama (LOOCV)")
+        st.subheader("📈 Kinerja Model SGWRF — Evaluasi Utama")
         g1, g2, g3, g4 = st.columns(4)
         g1.metric("RMSE (LOOCV)", f"{overall_cv['RMSE']:.4f}")
         g2.metric("MAE (LOOCV)", f"{overall_cv['MAE']:.4f}")
@@ -1578,7 +1513,7 @@ else:
         if baseline_results is None:
             st.info("Model baseline tidak dijalankan. Aktifkan opsi di sidebar lalu jalankan ulang analisis.")
         else:
-            st.subheader("Perbandingan SGWRF vs Model Baseline (semua LOOCV)")
+            st.subheader("🆚 Perbandingan SGWRF vs Model Baseline")
             st.dataframe(baseline_results, use_container_width=True)
 
             fig_bar = make_subplots(rows=1, cols=2, subplot_titles=("RMSE (lebih rendah lebih baik)", "R² (lebih tinggi lebih baik)"))
